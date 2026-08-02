@@ -176,12 +176,33 @@ const verdictSchema = z
 	.strict();
 
 /**
+ * The body of a lone ```-fenced block, or `undefined` when `trimmed` is not
+ * exactly one fence wrapping exactly one thing.
+ *
+ * Anchored at both ends, so prose on either side of the fence never matches. A
+ * body carrying its own fence means the response held two blocks, not one, and
+ * choosing between them would be a guess.
+ */
+function unwrapFence(trimmed: string): string | undefined {
+	const body = /^```[A-Za-z]*\r?\n([\s\S]*?)\r?\n?```$/.exec(trimmed)?.[1]?.trim();
+	if (body === undefined || body.length === 0 || body.includes("```")) return undefined;
+	return body;
+}
+
+/**
  * Parse exactly one strict JSON object into a {@link Verdict}.
  *
- * There is no repair path and no partial parse. Markdown fences, any prose
- * outside the object, unknown keys, an unknown risk class, a malformed
- * suggestion, and oversized output are all rejections — a judge that cannot
- * follow the output contract has not judged anything.
+ * There is no repair path and no partial parse. Prose outside the object,
+ * unknown keys, an unknown risk class, a malformed suggestion, and oversized
+ * output are all rejections — a judge that cannot follow the output contract has
+ * not judged anything.
+ *
+ * One envelope is tolerated: a single complete markdown fence around a single
+ * object. Every model family probed either emits a bare object or fences one,
+ * and the output contract's "no markdown fences" instruction does not stop the
+ * ones that fence. Unwrapping decides nothing the bare form would not have
+ * decided, because the fence still has to hold exactly one object and nothing
+ * else. What stays impossible is slicing JSON out of a larger response.
  *
  * Exported so the evaluation harness scores the same parser the gate runs.
  */
@@ -196,15 +217,17 @@ export function parseVerdict(
 
 	const trimmed = raw.trim();
 	if (trimmed.length === 0) return { ok: false, reason: "output is empty" };
-	// A fenced block, a prose preamble, and a trailing "Hope this helps!" all
-	// fail here rather than being sliced out of a larger response.
-	if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+
+	const candidate = unwrapFence(trimmed) ?? trimmed;
+	// A prose preamble, a trailing "Hope this helps!", a second object, and a
+	// second fence all fail here rather than being sliced out.
+	if (!candidate.startsWith("{") || !candidate.endsWith("}")) {
 		return { ok: false, reason: "output is not a single bare JSON object" };
 	}
 
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(trimmed);
+		parsed = JSON.parse(candidate);
 	} catch (error) {
 		return { ok: false, reason: `output is not valid JSON: ${describeError(error)}` };
 	}

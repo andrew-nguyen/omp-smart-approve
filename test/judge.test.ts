@@ -210,9 +210,25 @@ describe("parseVerdict", () => {
 		expect(parseVerdict(raw, 4_000).ok).toBe(true);
 	});
 
+	// Every model probed on 2026-08-02 that fences (anthropic/claude-haiku-4-5,
+	// anthropic/claude-sonnet-4-5) emits exactly this shape, and the output
+	// contract's "no markdown fences" instruction does not stop them. A fence is
+	// an envelope, not ambiguity: it holds one object and nothing else, so
+	// unwrapping it decides nothing the bare form would not have decided.
 	test.each([
-		["fenced json", `\`\`\`json\n${ALLOW_JSON}\n\`\`\``],
-		["fenced without a language", `\`\`\`\n${ALLOW_JSON}\n\`\`\``],
+		["a json-tagged fence", `\`\`\`json\n${ALLOW_JSON}\n\`\`\``],
+		["a fence with no language tag", `\`\`\`\n${ALLOW_JSON}\n\`\`\``],
+		["a fence with surrounding whitespace", `\n  \`\`\`json\n${ALLOW_JSON}\n\`\`\`  \n`],
+		["a pretty-printed fenced body", `\`\`\`json\n${JSON.stringify(JSON.parse(ALLOW_JSON), null, 2)}\n\`\`\``],
+	])("accepts %s", (_label, raw) => {
+		const result = parseVerdict(raw, 4_000);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.verdict.decision).toBe("allow");
+		expect(result.verdict.risk).toBe("uncertain");
+	});
+
+	test.each([
 		["prose before", `Here is my verdict: ${ALLOW_JSON}`],
 		["prose after", `${ALLOW_JSON}\n\nLet me know if you need more detail.`],
 		["two objects", `${ALLOW_JSON}${BLOCK_JSON}`],
@@ -220,6 +236,18 @@ describe("parseVerdict", () => {
 		["empty output", ""],
 		["whitespace only", "   \n\t "],
 		["truncated json", '{"decision":"allow","risk":"uncertain","rationale":"cut off'],
+		// Unwrapping a fence must not become licence to hunt for JSON in a larger
+		// response: everything below still holds more than one candidate, and
+		// picking one would be a guess made inside a security control.
+		["prose before a fence", `Here is my verdict:\n\`\`\`json\n${ALLOW_JSON}\n\`\`\``],
+		["prose after a fence", `\`\`\`json\n${ALLOW_JSON}\n\`\`\`\nHope this helps!`],
+		["two fenced objects", `\`\`\`json\n${ALLOW_JSON}\n\`\`\`\n\`\`\`json\n${BLOCK_JSON}\n\`\`\``],
+		["a fence holding two objects", `\`\`\`json\n${ALLOW_JSON}${BLOCK_JSON}\n\`\`\``],
+		["an unterminated fence", `\`\`\`json\n${ALLOW_JSON}`],
+		["a fence with no closing newline content", "```json\n```"],
+		["a fence holding an array", `\`\`\`json\n[${ALLOW_JSON}]\n\`\`\``],
+		["a fence holding prose", "```json\nI cannot judge this call.\n```"],
+		["an inline single-backtick wrap", `\`${ALLOW_JSON}\``],
 	])("rejects %s", (_label, raw) => {
 		const result = parseVerdict(raw, 4_000);
 		expect(result.ok).toBe(false);

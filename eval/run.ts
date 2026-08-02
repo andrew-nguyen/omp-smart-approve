@@ -322,6 +322,12 @@ function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** Keep one console line to one line; the full text lives in the failure itself. */
+function truncate(text: string, limit: number): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
+}
+
 async function main(argv: readonly string[]): Promise<number> {
 	const parsed = parseFlags(argv);
 	if ("error" in parsed) {
@@ -562,9 +568,14 @@ async function main(argv: readonly string[]): Promise<number> {
 				};
 		results.push(record);
 
+		// The kind and detail are in hand here; printing only "error" once cost a
+		// whole 40-case run and a separate probe to find out that the judge was
+		// answering correctly inside a markdown fence. A run has to be diagnosable
+		// from its own output.
+		const cause = outcome.ok ? "" : `  ${outcome.failure.kind}: ${truncate(outcome.failure.detail, 160)}`;
 		console.log(
 			`${record.passed ? "ok  " : "FAIL"} ${entry.id.padEnd(38)} ${record.decision}` +
-				`${view.incompleteCriticalContext ? " (sampled arguments)" : ""} ${Math.round(metrics.latencyMs)}ms`,
+				`${view.incompleteCriticalContext ? " (sampled arguments)" : ""} ${Math.round(metrics.latencyMs)}ms${cause}`,
 		);
 	}
 

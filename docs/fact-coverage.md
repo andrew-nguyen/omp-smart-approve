@@ -41,7 +41,7 @@ bun install --frozen-lockfile && bun run check && bun test && bun run smoke && b
 | 15 | Untrusted tool-output bodies are not copied wholesale; provenance is sent instead | `test/provenance.test.ts` (bounded ring, 200-char redacted summaries, source/trust labelling) |
 | 16 | Reuses OMP's secret machinery before judge requests and audit | `test/context.test.ts` (configured secret never appears in judge input, input not mutated); `test/omp-contract.test.ts` "secret machinery"; `test/audit-redaction.test.ts` |
 | 17 | Oversized argument fields cannot be silently allowed; scanners still read complete values | `test/context.test.ts` (`incompleteCriticalContext`, full-bytes hash, surviving tail); `test/judge.test.ts` "allow under incompleteCriticalContext is rejected" |
-| 18 | Strict structured verdict; malformed output is a failure, not an allow | `test/judge.test.ts` "parseVerdict" (every malformed class rejected) |
+| 18 | Strict structured verdict; malformed output is a failure, not an allow | `test/judge.test.ts` "parseVerdict" (every malformed class rejected, including prose either side of a fence, two fenced objects, and a fence holding anything but one object). One envelope is accepted — a single complete markdown fence around a single object — because most model families fence despite the prompt forbidding it; see deviation 6 |
 | 19 | Hard block only for a clear violation; consequential and uncertain escalate | `test/judge.test.ts` system-prompt charter; `test/gate.test.ts` "native auto branch" |
 | 20 | 5s target, 10s per-attempt timeout, one retry, configurable | `test/config.test.ts` "deadline invariant"; `test/judge.test.ts` retry policy; `test/deadline.test.ts` |
 | 21 | On the auto branch every judge failure escalates then blocks; on the prompt branch it is shown and only OMP's prompt authorizes | `test/gate.test.ts` "every failure stage becomes escalation, never allow", "judge failure is shown in the card and still falls through" |
@@ -64,7 +64,7 @@ bun install --frozen-lockfile && bun run check && bun test && bun run smoke && b
 | 38 | Configuration exposes providers, sensitivity, scope, size thresholds, timeouts, escalation, rules, audit | `test/config.test.ts` (schema strictness across every section) |
 | 39 | Commands for status, setup, rules, review, override, and bypass | `test/commands.test.ts` (all nine subcommands); `test/omp-contract.test.ts` "registers exactly one namespaced command" |
 | 40 | Compact redacted audit metadata; no raw arguments, messages, or secrets duplicated | `test/audit-redaction.test.ts` (including a raw-file byte scan of the database and WAL, with a positive control); `test/gate.test.ts` "no raw argument value reaches the audit row"; `scripts/smoke.ts` redaction sweep. **The guard is runtime, not type-level** — see the note below. |
-| 41 | Deterministic tests across scoping, precedence, model selection, isolation, redaction, oversized args, verdicts, fail-closed paths, UI defaults, brokering, nonce/TTL, loop breaking, overrides, bypass, audit redaction | The whole `test/` suite — 837 tests across 20 files |
+| 41 | Deterministic tests across scoping, precedence, model selection, isolation, redaction, oversized args, verdicts, fail-closed paths, UI defaults, brokering, nonce/TTL, loop breaking, overrides, bypass, audit redaction | The whole `test/` suite — 848 tests across 20 files |
 | 42 | Opt-in live evaluation over a versioned adversarial/benign corpus with a machine-readable report | `test/eval-schema.test.ts`; `eval/cases.jsonl` (40 cases, 13 categories); `bun run eval:live -- --help` |
 | 43 | Ordinary CI needs no credentials; live evaluation is opt-in | `test/package.test.ts` "ordinary CI scripts never reference a provider credential"; the release sequence runs green with every provider key unset |
 | 44 | Docs, example deterministic and natural-language policies, and a local smoke check | `README.md`, `examples/smart-approve.yml`, `examples/SMART_APPROVE.md`, `scripts/smoke.ts` (12 scenarios) |
@@ -125,10 +125,10 @@ have caught it before any test ran.
 
 ## Deviations, and why
 
-Five places where the implementation departs from what was written down. The
+Six places where the implementation departs from what was written down. The
 first four are `goals/smart-approve/plan.md` assumptions that did not survive
 contact with OMP 17.2.4. The fifth is a deliberate narrowing of two accepted
-facts.
+facts. The sixth is a widening, forced by what real models actually emit.
 
 ### 1. `--auto-approve` is not observable through settings
 
@@ -259,3 +259,47 @@ bound to the working directory they were approved from".
 A user-wide grant remains **unbuilt on purpose**. It is the one item in the facts
 that would let a single approval follow an agent into every project on the
 machine, and its absence is what keeps grants from leaking between checkouts.
+
+### 6. The verdict parser accepts one markdown fence
+
+The output contract tells the judge to emit "exactly one raw JSON object and
+nothing else: no markdown fences, no ```json, no prose before or after". The
+first live evaluation run, on 2026-08-02, failed **all 40 cases** with
+`malformed-output`. The judgments themselves were correct; every one arrived
+inside a fence.
+
+Measured across exact model IDs, one benign corpus case, identical prompt:
+
+| Model | Output |
+| --- | --- |
+| `anthropic/claude-haiku-4-5` | ` ```json ` fenced |
+| `anthropic/claude-sonnet-4-5` | ` ```json ` fenced |
+| `openai-codex/gpt-5.4-mini` | bare object |
+
+Prompting does not fix it — the instruction is already there and is ignored.
+Assistant prefill (a trailing `{` turn) does not fix it either: OMP's
+`completeSimple` does not pass a trailing assistant message to the provider as a
+prefill, so the response still opened with a fence. Reaching prefill would mean
+bypassing OMP's completion port, which is where the credential guarantees live.
+
+So `parseVerdict` now unwraps **exactly one complete fence around exactly one
+object**, and nothing else changed. A fence is an envelope, not ambiguity. These
+all still fail, and are tested:
+
+- prose before or after the fence
+- two fenced objects, or a fence whose body carries another fence
+- a fence holding an array, prose, or two objects
+- an unterminated fence, or a single-backtick wrap
+- every pre-existing bare-output rejection
+
+The property that matters is unchanged: the response must contain exactly one
+verdict and nothing else. Slicing JSON out of a larger response — the actual
+injection surface — remains impossible.
+
+The alternative considered and rejected was routing the call through BAML for
+schema-aligned parsing. BAML owns the HTTP call, so it would have replaced OMP's
+model registry as the credential path, dropped the providers OMP authenticates
+by OAuth or ADC rather than a bearer key, and added eight native binaries plus
+install-time telemetry to a package with one pure-TypeScript dependency. Its
+parser is also deliberately more permissive than this one: it extracts JSON from
+prose, which is the behavior this parser exists to refuse.
