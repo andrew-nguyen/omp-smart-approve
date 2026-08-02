@@ -844,6 +844,16 @@ describe("session bypass", () => {
 		});
 		expect(result.decision).toBe("block");
 	});
+
+	test("a bypass does not stop the pre-screen on a call OMP prompts about", async () => {
+		// The bypass exists to stop judging calls OMP would run unattended. A call
+		// OMP asks about is still screened, and a judge block there still blocks —
+		// which is what `/smart-approve unguarded` tells the operator.
+		const h = harness({ bypassActive: () => true, judge: async () => verdict("block", "prompt-injection") });
+		const result = await h.gate.evaluate(makeRequest({}), PROMPT);
+		expect(h.judgeCalls).toHaveLength(1);
+		expect(result.decision).toBe("block");
+	});
 });
 
 describe("audit durability", () => {

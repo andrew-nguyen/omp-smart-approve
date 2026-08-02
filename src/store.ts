@@ -369,9 +369,14 @@ export interface SmartApproveStore {
 	listEvents(auditId: string): AuditEvent[];
 
 	putGrant(grant: Grant): void;
-	/** Atomic single-use consumption. Returns the grant only if unconsumed, unexpired, and policyHash matches. */
+	/**
+	 * Atomic single-use consumption, for every scope. Returns the grant only if
+	 * unconsumed, unexpired, location-matched, and policyHash-matched. The gate
+	 * admits a call by consuming, so scope decides an unused grant's lifetime and
+	 * never how many calls it can admit.
+	 */
 	consumeGrant(argumentsHash: string, policyHash: string, cwd: string, now: number): Grant | undefined;
-	/** Non-consuming lookup, for reusable (`session`/`persistent`) grants. */
+	/** Read-only probe: is a grant live right now? Same predicate, no consumption. */
 	findGrant(argumentsHash: string, policyHash: string, cwd: string, now: number): Grant | undefined;
 	/**
 	 * Purges every allow grant *not* bound to the supplied policy hash. Call it

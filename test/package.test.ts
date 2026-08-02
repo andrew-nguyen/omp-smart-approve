@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 
@@ -140,12 +140,27 @@ describe("no silent kill switch", () => {
 		}
 	});
 
-	test("no source file reads an environment variable that could disable the gate", () => {
-		const sources = ["src/index.ts", "src/gate.ts", "src/policy.ts", "src/config.ts"];
-		for (const relative of sources) {
-			const source = readFileSync(path.join(REPO, relative), "utf8");
-			expect(source).not.toMatch(/env\.\w*SMART_APPROVE\w*(DISABLE|OFF|SKIP|BYPASS)/i);
-			expect(source).not.toMatch(/SMART_APPROVE_(DISABLE|OFF|SKIP|BYPASS)/i);
+	test("`no environment variable disables it` is true of every env read in src", () => {
+		// The claim `/smart-approve unguarded` prints. Absence cannot be observed by
+		// running the thing, so it is checked at the source — the same reason the
+		// sibling test walks the config schema. Scanning for suggestive names would
+		// miss `Bun.env.NEVERMIND`, so this enumerates every read instead.
+		const sourceDir = path.join(REPO, "src");
+		const names = new Set<string>();
+		let bareReads = 0;
+
+		for (const file of readdirSync(sourceDir)) {
+			if (!file.endsWith(".ts")) continue;
+			const source = readFileSync(path.join(sourceDir, file), "utf8");
+			bareReads += [...source.matchAll(/(?:process|Bun)\.env\b/g)].length;
+			for (const match of source.matchAll(/(?:process|Bun)\.env(?:\.(\w+)|\[["'](\w+)["']\])/g)) {
+				names.add(match[1] ?? match[2] ?? "");
+			}
 		}
+
+		// Both reads locate files, and neither can turn the gate off. The counts
+		// match, so the environment is never taken wholesale either.
+		expect([...names].sort()).toEqual(["HOME", "PI_CODING_AGENT_DIR"]);
+		expect(bareReads).toBe(names.size);
 	});
 });

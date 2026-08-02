@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { holdCall, resetBrokerForTests } from "../src/broker.ts";
+import { holdCall, registerEndpoint, resetBrokerForTests } from "../src/broker.ts";
 import {
 	type CommandDeps,
 	clearSuggestions,
@@ -12,12 +12,13 @@ import {
 	OVERRIDE_DENY,
 	OVERRIDE_EXPIRE,
 	recordSuggestion,
+	SUBCOMMANDS,
 } from "../src/commands.ts";
 import { type ResolvedConfig, resolveConfig, smartApproveConfigSchema } from "../src/config.ts";
-import type { FrozenCall, PendingApproval, PolicyRule } from "../src/contracts.ts";
-import { hashArguments } from "../src/policy.ts";
+import type { CallTarget, FrozenCall, Grant, PendingApproval, PolicyRule } from "../src/contracts.ts";
+import { hashArguments, matchExactAllow } from "../src/policy.ts";
 import { openStore, type SmartApproveStore } from "../src/store.ts";
-import { STATUS_KEY, type UiHost, WIDGET_BYPASS } from "../src/ui.ts";
+import { formatDuration, STATUS_KEY, type UiHost, WIDGET_BYPASS } from "../src/ui.ts";
 
 const NOW = 1_700_000_000_000;
 /** Deterministic so a test can queue a matching (or deliberately wrong) answer. */
@@ -47,6 +48,8 @@ interface UiScript {
 	selects?: Array<string | undefined>;
 	inputs?: Array<string | undefined>;
 	confirms?: boolean[];
+	/** Runs when a confirm dialog is answered, so a test can change state mid-command. */
+	onConfirm?: () => void;
 }
 
 function createFakeUi(script: UiScript = {}): FakeUi {
@@ -67,6 +70,7 @@ function createFakeUi(script: UiScript = {}): FakeUi {
 		},
 		confirm: async (title, message) => {
 			confirms.push({ title, message });
+			script.onConfirm?.();
 			return confirmQueue.length === 0 ? false : (confirmQueue.shift() ?? false);
 		},
 		input: async (title, placeholder) => {
@@ -272,6 +276,50 @@ function storedRule(overrides: Partial<PolicyRule> = {}): PolicyRule {
 		specificity: 412,
 		...overrides,
 	};
+}
+
+/** A live allow grant for the seeded call, in `cwd`. */
+function grantIn(id: string, cwd: string): Grant {
+	return {
+		id,
+		auditId: "audit-a",
+		argumentsHash: ARGS_HASH,
+		canonicalHash: "canon-1",
+		policyHash: resolved.policyHash,
+		cwd,
+		scope: "persistent",
+		expiresAt: NOW + 600_000,
+		createdBy: "human",
+		reason: "approved once",
+	};
+}
+
+/** A committed verdict at an arbitrary instant, for window and aggregate claims. */
+function commitDecision(auditId: string, createdAt: number): void {
+	const begun = {
+		auditId,
+		toolCallId: `${auditId}-call`,
+		toolName: "write",
+		operation: "write",
+		targetSummary: "path:/etc/shadow",
+		argumentsHash: ARGS_HASH,
+		canonicalHash: "canon-1",
+		policyHash: resolved.policyHash,
+		sourceAgentId: "Researcher",
+		sourceAgentKind: "sub" as const,
+		cwd: resolved.paths.cwd,
+		retryFamilyKey: `family-${auditId}`,
+		createdAt,
+	};
+	store.beginAudit(begun);
+	store.commitAudit({
+		...begun,
+		decision: "block",
+		stage: "judge",
+		risk: "destructive-action",
+		rationale: "overwrites the system password database",
+		retryCount: 0,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -980,7 +1028,7 @@ describe("unguarded and guarded", () => {
 		expect(widget?.lines?.join("\n")).toContain("SMART APPROVE IS UNGUARDED");
 		expect(h.fake.statuses).toContainEqual({
 			key: STATUS_KEY,
-			text: "UNGUARDED — Smart Approve is disabled for this session",
+			text: "UNGUARDED — calls OMP would run unattended are not judged",
 		});
 		expect(h.fake.notices.some(n => n.type === "error")).toBe(true);
 	});
@@ -1054,21 +1102,6 @@ describe("rule revocation is global, exactly as its confirm dialog promises", ()
 	// "every outstanding allow grant" it must mean every one, not this directory's.
 	const OTHER_REPO = "/srv/other-checkout";
 
-	function grantIn(id: string, cwd: string) {
-		return {
-			id,
-			auditId: "audit-a",
-			argumentsHash: ARGS_HASH,
-			canonicalHash: "canon-1",
-			policyHash: resolved.policyHash,
-			cwd,
-			scope: "persistent" as const,
-			expiresAt: NOW + 600_000,
-			createdBy: "human",
-			reason: "approved once",
-		};
-	}
-
 	test("the confirm dialog states the scope it actually has", async () => {
 		seedCall("audit-a");
 		store.putRule(storedRule());
@@ -1127,5 +1160,492 @@ describe("rule revocation is global, exactly as its confirm dialog promises", ()
 		store.putGrant(grantIn("elsewhere", OTHER_REPO));
 		await harness({ script: { confirms: [false] } }).run("rules revoke rule-1");
 		expect(store.listGrants()).toHaveLength(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Operator-facing text
+//
+// Every test below takes one sentence the software shows a human, builds the
+// case that sentence rules out, and fails if the sentence is not true of it.
+// Asserting a string is present is not asserting it is true.
+// ---------------------------------------------------------------------------
+
+describe("setup states what it will not do, and does not do it", () => {
+	test("never falls back to the session model, even when one is answering prompts", async () => {
+		// The dangerous reading: "no authenticated model" means "none at all", so an
+		// operator assumes setup would have used the model they are chatting with.
+		const h = harness({ models: [], current: { id: "gpt-fast", provider: "openai" } });
+		const out = await h.run("setup");
+
+		expect(out).toContain("never falls back to the primary session model");
+		expect(out).toContain("Nothing was written");
+		expect(out).not.toContain("gpt-fast");
+		expect(h.writes).toHaveLength(0);
+		expect(h.fake.confirms).toHaveLength(0);
+	});
+});
+
+describe("status reports what it read, not what it assumed", () => {
+	test("the selected judge can authenticate here; it is not just the first authorized", async () => {
+		const twoAuthorized: ResolvedConfig = {
+			...resolved,
+			config: {
+				...resolved.config,
+				judge: {
+					...resolved.config.judge,
+					authorizedModels: ["anthropic/claude-fast", "openai/gpt-fast"],
+				},
+			},
+		};
+		const out = await harness({
+			resolvedOverrides: twoAuthorized,
+			models: [{ id: "gpt-fast", provider: "openai" }],
+		}).run("status");
+
+		expect(out).toContain("1 of 2 authorized model(s) available with auth");
+		expect(out).toContain("selected:   openai/gpt-fast");
+		expect(out).toContain("auth:       healthy");
+	});
+
+	test("an unreadable database reads as unknown, never as an all-clear", async () => {
+		seedCall("audit-a");
+		commitDecision("audit-decided", NOW - 60_000);
+		// One escalation is open and one decision is committed, so zeroes below would
+		// be fabrications rather than an empty database.
+		store.close();
+
+		const out = await harness().run("status");
+		expect(out).toContain("health: FAILING");
+		expect(out).toContain("Open pending approvals: unknown — the audit database could not be read");
+		expect(out).not.toContain("Open pending approvals: 0");
+		expect(out).not.toContain("total 0");
+	});
+
+	test("the 24h heading means 24h: an older decision is not counted", async () => {
+		commitDecision("audit-inside", NOW - 60_000);
+		commitDecision("audit-outside", NOW - 25 * 60 * 60_000);
+
+		const out = await harness().run("status");
+		expect(out).toContain("Recent decisions (last 24h 00m):");
+		expect(out).toContain("total 1  allow 0  escalate 0  block 1");
+	});
+
+	test("the approval channel reads live only when a main interactive endpoint exists", async () => {
+		expect(await harness().run("status")).toContain(
+			"main approval UI: ABSENT — escalations block instead of prompting",
+		);
+
+		registerEndpoint({
+			agentId: "Main",
+			agentKind: "main",
+			capability: "interactive",
+			present: async () => undefined,
+		});
+		expect(await harness().run("status")).toContain("main approval UI: live");
+	});
+
+	test("a headless session is called headless", async () => {
+		expect(await harness({ script: { hasUI: false } }).run("status")).toContain("this session UI:  headless");
+	});
+});
+
+describe("rules text is derived from the matching predicate, not from kind", () => {
+	const TARGETS: readonly CallTarget[] = [
+		{ kind: "path", requested: "/srv/app/build.log", resolved: "/srv/app/build.log", dynamic: false },
+	];
+
+	test("the footer sentence is true: only the fully pinned allow skips the judge", async () => {
+		const complete = storedRule({ id: "pinned", argumentsHash: ARGS_HASH, cwd: resolved.paths.cwd });
+		const noHash = storedRule({ id: "no-hash", cwd: resolved.paths.cwd });
+		const noCwd = storedRule({ id: "no-cwd", argumentsHash: ARGS_HASH });
+		const patterned = storedRule({
+			id: "patterned",
+			target: "/srv/app/**",
+			argumentsHash: ARGS_HASH,
+			cwd: resolved.paths.cwd,
+		});
+		for (const rule of [complete, noHash, noCwd, patterned]) store.putRule(rule);
+
+		// The sentence's claim, asked of the predicate the gate actually applies.
+		expect(matchExactAllow([complete], "write", ARGS_HASH, TARGETS, resolved.paths.cwd)?.id).toBe("pinned");
+		for (const rule of [noHash, noCwd, patterned]) {
+			expect(matchExactAllow([rule], "write", ARGS_HASH, TARGETS, resolved.paths.cwd)).toBeUndefined();
+		}
+
+		const out = await harness().run("rules");
+		expect(out).toContain("An allow skips the judge only when it is exact AND pins the call with an");
+		// Four rules listed, one bypass label: the labels track the predicate.
+		expect(out.match(/skips the judge for this precise call/g)).toHaveLength(1);
+	});
+
+	test("the origin column distinguishes a config rule from a stored one", async () => {
+		store.putRule(storedRule({ id: "stored-1" }));
+		const configured = storedRule({ id: "cfg-1", createdBy: "project", source: "smart-approve.yml" });
+		const out = await harness({ resolvedOverrides: { rules: [configured] } }).run("rules");
+
+		expect(out).toContain("From configuration (1):");
+		expect(out).toContain("Stored in the audit database (1):");
+		expect(out).toContain("cfg-1  [allow-exact]  config");
+		expect(out).toContain("stored-1  [allow-exact]  store");
+	});
+
+	test("show names each missing field on its own, as the footer promises", async () => {
+		store.putRule(storedRule({ id: "no-hash", cwd: resolved.paths.cwd }));
+		store.putRule(storedRule({ id: "no-cwd", argumentsHash: "a".repeat(64) }));
+
+		const noHash = await harness().run("rules show no-hash");
+		expect(noHash).toContain("argsHash:    (absent — cannot skip the judge)");
+		expect(noHash).toContain(`cwd:         ${resolved.paths.cwd}`);
+
+		const noCwd = await harness().run("rules show no-cwd");
+		expect(noCwd).toContain("cwd:         (absent — cannot skip the judge)");
+		expect(noCwd).toContain(`argsHash:    ${"a".repeat(64)}`);
+	});
+
+	test("show labels a pattern target as a pattern", async () => {
+		store.putRule(storedRule({ id: "rule-p", target: "/srv/app/**" }));
+		expect(await harness().run("rules show rule-p")).toContain("target:      /srv/app/** (pattern)");
+	});
+
+	test("every action the error message names actually works", async () => {
+		store.putRule(storedRule());
+		expect(await harness().run("rules frobnicate")).toContain("Use list, show, or revoke.");
+		expect(await harness().run("rules list")).toContain("SMART APPROVE RULES");
+		expect(await harness().run("rules show rule-1")).toContain("Rule rule-1");
+		expect(await harness().run("rules revoke rule-1")).toContain("Cancelled");
+	});
+});
+
+describe("revoke reports only what it changed", () => {
+	test("`Deny rules are untouched` is true of a stored deny rule", async () => {
+		seedCall("audit-a");
+		store.putRule(storedRule());
+		store.putRule(storedRule({ id: "deny-1", kind: "deny-exact", target: "/etc/shadow" }));
+
+		const out = await harness({ script: { confirms: [true] } }).run("rules revoke rule-1");
+		expect(out).toContain("Deny rules are untouched");
+		expect(store.listRules().map(rule => rule.id)).toEqual(["deny-1"]);
+	});
+
+	test("`cannot be revoked here` means nothing was touched, not even a grant", async () => {
+		seedCall("audit-a");
+		store.putRule(storedRule({ id: "stored-1" }));
+		store.putGrant(grantIn("live", resolved.paths.cwd));
+		const configured = storedRule({ id: "cfg-1", createdBy: "project", source: "smart-approve.yml" });
+
+		const h = harness({ resolvedOverrides: { rules: [configured] }, script: { confirms: [true] } });
+		const out = await h.run("rules revoke cfg-1");
+
+		expect(out).toContain("cannot be revoked here");
+		expect(h.fake.confirms).toHaveLength(0);
+		expect(store.listRules().map(rule => rule.id)).toEqual(["stored-1"]);
+		expect(store.findGrant(ARGS_HASH, resolved.policyHash, resolved.paths.cwd, NOW)).toBeDefined();
+	});
+
+	test("a rule that vanished mid-command reads as already gone, never as revoked", async () => {
+		seedCall("audit-a");
+		store.putRule(storedRule());
+		// A second session revokes it between the confirmation and the write.
+		const out = await harness({
+			script: { confirms: [true], onConfirm: () => store.revokeRule("rule-1") },
+		}).run("rules revoke rule-1");
+
+		expect(out).toContain("Rule rule-1 was already gone.");
+		expect(out).not.toContain("Revoked rule rule-1.");
+	});
+
+	test("a second revoke does not claim to have revoked anything", async () => {
+		seedCall("audit-a");
+		store.putRule(storedRule());
+		expect(await harness({ script: { confirms: [true] } }).run("rules revoke rule-1")).toContain(
+			"Revoked rule rule-1.",
+		);
+		expect(await harness({ script: { confirms: [true] } }).run("rules revoke rule-1")).toContain(
+			"No stored rule with ID rule-1.",
+		);
+	});
+});
+
+describe("commands named in output can be run on the identifiers shown", () => {
+	test("every subcommand the usage advertises is real", async () => {
+		const usage = await harness().run("");
+		for (const name of SUBCOMMANDS) {
+			expect(usage).toContain(name);
+			expect(await harness().run(name)).not.toContain("Unknown subcommand");
+		}
+	});
+
+	test("`pending` prints an audit ID that `review` can open", async () => {
+		seedCall("audit-a");
+		const listed = await harness().run("pending");
+		expect(listed).toContain("Inspect one with `/smart-approve review <audit-id>`.");
+
+		const id = /^ {2}(\S+) {2}\[/m.exec(listed)?.[1];
+		expect(id).toBe("audit-a");
+
+		const reviewed = await harness().run(`review ${id}`);
+		expect(reviewed).toContain("SMART APPROVE REVIEW — audit-a");
+		expect(reviewed).not.toContain("No Smart Approve record");
+	});
+
+	test("`review` points at an apply-suggestion command that finds the suggestion", async () => {
+		seedCall("audit-a");
+		recordSuggestion("audit-a", {
+			kind: "deny-pattern",
+			toolName: "write",
+			target: "/etc/**",
+			rationale: "system files are never an agent target",
+		});
+		expect(await harness().run("review audit-a")).toContain(
+			"Apply with `/smart-approve apply-suggestion <audit-id>`.",
+		);
+
+		const applied = await harness({ script: { confirms: [true] } }).run("apply-suggestion audit-a");
+		expect(applied).not.toContain("No live judge suggestion");
+		expect(store.listRules().map(rule => rule.id)).toEqual(["suggested-audit-a"]);
+	});
+});
+
+describe("review's immutability claim survives a human decision", () => {
+	test("`Original verdict (immutable)` still shows the original after an override", async () => {
+		seedCall("audit-a");
+		const before = store.getAudit("audit-a");
+		expect(before?.decision).toBe("escalate");
+
+		await harness({ script: { selects: [OVERRIDE_DENY], inputs: [CHALLENGE] } }).run("override audit-a");
+		expect(store.getAudit("audit-a")).toEqual(before);
+
+		const out = await harness().run("review audit-a");
+		expect(out).toContain("Original verdict (immutable)");
+		expect(out).toContain("decision: escalate at stage escalation");
+		expect(out).toContain("overwrites the system password database");
+		// The human's decision is additional history, not a rewrite of the verdict.
+		expect(out).toContain("denied by human: human denied via override");
+	});
+});
+
+describe("apply-suggestion cannot overstate what it inserted", () => {
+	const EXACT_TARGET = "/srv/app/build.log";
+
+	test("an exact suggested allow reads advisory and cannot skip the judge", async () => {
+		seedCall("audit-a");
+		recordSuggestion("audit-a", {
+			kind: "allow-exact",
+			toolName: "write",
+			target: EXACT_TARGET,
+			rationale: "one disposable file",
+		});
+
+		const out = await harness({ script: { confirms: [true] } }).run("apply-suggestion audit-a");
+		// A suggestion carries no arguments hash and no directory, so an exact target
+		// is not enough. Calling it a bypass is the misreading this label prevents.
+		expect(out).toContain("advisory posture — still judged (no argumentsHash, no cwd)");
+		expect(out).not.toContain("skips the judge");
+
+		const inserted = store.listRules();
+		expect(inserted[0]?.kind).toBe("allow-exact");
+		expect(
+			matchExactAllow(
+				inserted,
+				"write",
+				ARGS_HASH,
+				[{ kind: "path", requested: EXACT_TARGET, resolved: EXACT_TARGET, dynamic: false }],
+				resolved.paths.cwd,
+			),
+		).toBeUndefined();
+	});
+
+	test("`never persisted` is true: no durable row mentions a live suggestion", async () => {
+		seedCall("audit-a");
+		recordSuggestion("audit-a", {
+			kind: "deny-pattern",
+			toolName: "write",
+			target: "/etc/**",
+			rationale: "system files are never an agent target",
+		});
+
+		expect(store.listRules()).toHaveLength(0);
+		expect(store.listEvents("audit-a").some(event => event.detail.includes("/etc/**"))).toBe(false);
+
+		// Dropping process memory is what a restart does to a suggestion.
+		clearSuggestions();
+		const out = await harness({ script: { confirms: [true] } }).run("apply-suggestion audit-a");
+		expect(out).toContain("held in memory only and never persisted, so a restart clears them");
+		expect(store.listRules()).toHaveLength(0);
+	});
+});
+
+describe("grant scope text matches the grant that is minted", () => {
+	/** Mirrors `PERSISTENT_GRANT_TTL_MS`, which is deliberately not exported. */
+	const PERSISTENT_TTL_MS = 90 * 24 * 60 * 60_000;
+
+	test("a session grant is single use too, so nothing may promise reuse", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		const h = harness({ script: { selects: [OVERRIDE_APPROVE, SCOPE_SESSION], inputs: [CHALLENGE, "ok"] } });
+		const out = await h.run("override audit-a");
+
+		const offered = h.fake.selects.at(-1)?.options.find(option => option.label === SCOPE_SESSION)?.description;
+		expect(offered).toContain("Single use");
+		expect(offered).not.toContain("Reusable");
+		expect(out).toContain("Single use: the first matching call consumes it.");
+
+		// The gate admits a call by consuming the grant, whatever the scope.
+		expect(store.consumeGrant(ARGS_HASH, resolved.policyHash, resolved.paths.cwd, NOW)).toBeDefined();
+		expect(store.consumeGrant(ARGS_HASH, resolved.policyHash, resolved.paths.cwd, NOW)).toBeUndefined();
+	});
+
+	test("each scope's printed lifetime is the lifetime the grant receives", async () => {
+		const timeouts = resolved.config.timeouts;
+		const expected: ReadonlyArray<[string, number]> = [
+			[SCOPE_ONE_TIME, timeouts.brokerArgsTtlMs],
+			[SCOPE_SESSION, timeouts.pendingApprovalTtlMs],
+			[SCOPE_PERSISTENT, PERSISTENT_TTL_MS],
+		];
+
+		for (const [label, ttlMs] of expected) {
+			// Every harness restarts its id counter at `id-1`, and `putGrant` upserts
+			// by id, so the previous iteration's row has to go first.
+			store.revokeAllGrants(NOW);
+			const auditId = `audit-${label.replace(/\s+/g, "-")}`;
+			seedCall(auditId);
+			hold(auditId);
+			const h = harness({
+				script: { selects: [OVERRIDE_APPROVE, label], inputs: [CHALLENGE, "ok"], confirms: [true] },
+			});
+			const out = await h.run(`override ${auditId}`);
+
+			const offered = h.fake.selects.at(-1)?.options.find(option => option.label === label)?.description;
+			expect(offered).toContain(formatDuration(ttlMs));
+			expect(out).toContain(new Date(NOW + ttlMs).toISOString());
+			expect(store.listGrants().find(grant => grant.auditId === auditId)?.expiresAt).toBe(NOW + ttlMs);
+		}
+	});
+
+	test("`survives restarts` is true: a persistent grant outlives the database handle", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		await harness({
+			script: { selects: [OVERRIDE_APPROVE, SCOPE_PERSISTENT], inputs: [CHALLENGE, "ok"], confirms: [true] },
+		}).run("override audit-a");
+
+		const databasePath = path.join(root, "state", "state.sqlite");
+		store.close();
+		store = openStore(databasePath);
+		expect(store.findGrant(ARGS_HASH, resolved.policyHash, resolved.paths.cwd, NOW)?.scope).toBe("persistent");
+	});
+
+	test("`any change invalidates it` holds for arguments, directory, and policy", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		const out = await harness({
+			script: { selects: [OVERRIDE_APPROVE, SCOPE_SESSION], inputs: [CHALLENGE, "ok"] },
+		}).run("override audit-a");
+		expect(out).toContain(
+			"Any change to the arguments, the working directory, the configuration, or the policy invalidates it.",
+		);
+
+		const { policyHash } = resolved;
+		const cwd = resolved.paths.cwd;
+		expect(
+			store.findGrant(hashArguments({ ...ARGS, content: "one byte more" }), policyHash, cwd, NOW),
+		).toBeUndefined();
+		expect(store.findGrant(ARGS_HASH, policyHash, "/srv/other-checkout", NOW)).toBeUndefined();
+		expect(store.findGrant(ARGS_HASH, "policy-after-an-edit", cwd, NOW)).toBeUndefined();
+		// The untouched triple still matches, so the three misses are not vacuous.
+		expect(store.findGrant(ARGS_HASH, policyHash, cwd, NOW)).toBeDefined();
+	});
+
+	test("the printed expiry instant is the instant the grant stops working", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		await harness({ script: { selects: [OVERRIDE_APPROVE, SCOPE_ONE_TIME], inputs: [CHALLENGE, "ok"] } }).run(
+			"override audit-a",
+		);
+
+		const expiresAt = NOW + resolved.config.timeouts.brokerArgsTtlMs;
+		expect(store.findGrant(ARGS_HASH, resolved.policyHash, resolved.paths.cwd, expiresAt - 1)).toBeDefined();
+		expect(store.findGrant(ARGS_HASH, resolved.policyHash, resolved.paths.cwd, expiresAt)).toBeUndefined();
+	});
+
+	test("declining the scope prompt grants nothing and leaves the record open", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		const out = await harness({
+			script: { selects: [OVERRIDE_APPROVE, undefined], inputs: [CHALLENGE, "ok"] },
+		}).run("override audit-a");
+
+		expect(out).toContain("No scope chosen. Nothing was granted.");
+		expect(store.listGrants()).toHaveLength(0);
+		expect(store.getPending("audit-a")?.state).toBe("awaiting-human");
+	});
+});
+
+describe("closing an override closes it", () => {
+	test("`can no longer be approved` is true after expiring", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		await harness({ script: { selects: [OVERRIDE_EXPIRE], inputs: [CHALLENGE] } }).run("override audit-a");
+
+		const again = await harness({
+			script: { selects: [OVERRIDE_APPROVE, SCOPE_ONE_TIME], inputs: [CHALLENGE, "ok"] },
+		}).run("override audit-a");
+		expect(again).toContain("already resolved (expired)");
+		expect(store.listGrants()).toHaveLength(0);
+	});
+
+	test("`the record is closed` is true after denying", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		await harness({ script: { selects: [OVERRIDE_DENY], inputs: [CHALLENGE] } }).run("override audit-a");
+
+		const again = await harness({
+			script: { selects: [OVERRIDE_APPROVE, SCOPE_ONE_TIME], inputs: [CHALLENGE, "ok"] },
+		}).run("override audit-a");
+		expect(again).toContain("already resolved (denied)");
+		expect(store.listGrants()).toHaveLength(0);
+	});
+
+	test("`with no decision` is true of expire: no approval and no denial is recorded", async () => {
+		seedCall("audit-a");
+		hold("audit-a");
+		await harness({ script: { selects: [OVERRIDE_EXPIRE], inputs: [CHALLENGE] } }).run("override audit-a");
+
+		const types = store.listEvents("audit-a").map(event => event.type);
+		expect(types).toContain("expired");
+		expect(types).not.toContain("denied");
+		expect(types).not.toContain("granted");
+		expect(types).not.toContain("intent-recorded");
+	});
+});
+
+describe("the unguarded warning names what is still enforced", () => {
+	test("output and widget stop short of claiming nothing is screened", async () => {
+		const h = harness({ script: { inputs: [CHALLENGE, "debugging a broken sandbox"] } });
+		const out = await h.run("unguarded");
+
+		expect(out).toContain("Calls OMP would run unattended are no longer judged.");
+		expect(out).toContain(
+			"Still enforced: deny rules, protected targets, and the pre-screen on calls OMP prompts about.",
+		);
+		// Both of these shipped earlier and neither was true: a deny rule, a
+		// protected target, and a prompt-branch pre-screen all still block.
+		expect(out).not.toContain("Nothing is being screened");
+
+		const widget = h.fake.widgets.find(entry => entry.key === WIDGET_BYPASS)?.lines?.join("\n") ?? "";
+		expect(widget).toContain("Deny rules and protected targets still block.");
+		expect(widget).not.toContain("Every tool call runs without semantic screening");
+	});
+
+	test("a failed challenge repeats the no-off-switch promise, proven in package.test.ts", async () => {
+		const h = harness({ script: { inputs: ["not-the-challenge"] } });
+		const out = await h.run("unguarded");
+
+		expect(out).toContain("Smart Approve stays on.");
+		expect(out).toContain("There is no configuration key and no environment variable that disables it.");
+		expect(h.bypass.active).toBe(false);
+		// The sentence itself is proven by "no silent kill switch" in
+		// test/package.test.ts: the schema walk and the env-read enumeration.
 	});
 });

@@ -554,21 +554,10 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 					randomId,
 					randomChallenge,
 					recomputeHash: hashArguments,
-					bypass: {
-						active: () => bypass.active(),
-						enable: reason => {
-							bypass.enable(reason);
-							ctx.ui.setWidget(WIDGET_BYPASS, [
-								"SMART APPROVE IS UNGUARDED FOR THIS SESSION",
-								`Reason: ${reason}`,
-								`Re-enable with /${COMMAND_NAME} guarded`,
-							]);
-						},
-						disable: () => {
-							bypass.disable();
-							ctx.ui.setWidget(WIDGET_BYPASS, undefined);
-						},
-					},
+					// The unguarded warning has exactly one renderer, in `unguarded`
+					// and `guarded`, so two copies of it cannot drift apart. This port
+					// carries session state and nothing else.
+					bypass,
 					models: {
 						list: () => ctx.models.list().map(m => ({ id: m.id, provider: m.provider })),
 						current: () => {

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { bindDecision, holdCall, resetBrokerForTests } from "../src/broker.ts";
-import { resolveConfig } from "../src/config.ts";
+import { effectiveSensitivity, resolveConfig } from "../src/config.ts";
 import type { AuditEvent, AuditRecord, EscalationRequest, FrozenCall, PendingApproval } from "../src/contracts.ts";
 import type { RiskCard } from "../src/gate.ts";
 import { hashArguments } from "../src/policy.ts";
@@ -337,6 +337,30 @@ describe("renderApprovalRequest", () => {
 		expect(text).toContain("arguments cannot be rendered");
 		expect(text).not.toContain("visible");
 	});
+
+	test("`complete, exactly as the agent wrote them` holds for a payload big enough to tempt truncation", () => {
+		// The sentence above the arguments promises the whole call. A renderer that
+		// elided, summarized, or capped anything would make a human approve a call
+		// they only partly saw — the one failure this dialog exists to prevent.
+		const long = "A".repeat(4_000);
+		const args: Record<string, unknown> = {
+			first: "head-marker",
+			blob: long,
+			token: "sk-live-should-still-be-visible",
+			nested: { deep: { deeper: ["x", "y", { last: "leaf-marker" }] } },
+			last: "tail-marker",
+		};
+		const text = renderApprovalRequest(request({ frozenCall: frozen(args) }), 30_000).join("\n");
+
+		expect(text).toContain("Literal arguments (complete, exactly as the agent wrote them):");
+		expect(text).toContain(`"first": "head-marker"`);
+		expect(text).toContain(`"${long}"`);
+		expect(text).toContain(`"token": "sk-live-should-still-be-visible"`);
+		expect(text).toContain(`"last": "leaf-marker"`);
+		expect(text).toContain(`"last": "tail-marker"`);
+		expect(text).not.toContain("…");
+		expect(text).not.toContain("[truncated");
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -359,7 +383,11 @@ describe("renderRiskCard", () => {
 		expect(text).toContain("pipes repository contents to an external host");
 		expect(text).toContain("command:curl, url:https://drop.example/upload");
 		expect(text).toContain("audit-7");
-		expect(text).toContain("available");
+		// Not `toContain("available")`: that substring is also inside "UNAVAILABLE",
+		// so the weaker assertion would pass on the opposite claim.
+		expect(text).toContain("Judge:       available");
+		expect(text).not.toContain("UNAVAILABLE");
+		expect(text).not.toContain("not semantically screened");
 		// The native prompt already shows the literal call; this card must not.
 		expect(text).not.toContain("root::0:0:::");
 		expect(text).not.toContain('"content"');
@@ -523,6 +551,138 @@ describe("renderStatus", () => {
 			database: { path: input.resolved.databasePath, healthy: false, detail: "disk I/O error" },
 		}).join("\n");
 		expect(text).toContain("health: FAILING — disk I/O error");
+	});
+
+	test("counts the database could not supply read as unknown, not as zero", () => {
+		// The fixture has both counts; omitting them is the only difference, so the
+		// text below cannot come from an empty database.
+		const { openPending, aggregate, ...rest } = baseInput(makeRoot());
+		expect(openPending).toBe(0);
+		expect(aggregate.total).toBe(12);
+
+		const text = renderStatus({
+			...rest,
+			database: { path: rest.database.path, healthy: false, detail: "disk I/O error" },
+		}).join("\n");
+		// "0 waiting" and "0 decisions" would read as all-clear at the one moment
+		// nothing is known.
+		expect(text).toContain("Open pending approvals: unknown — the audit database could not be read");
+		expect(text).not.toContain("Open pending approvals: 0");
+		expect(text).not.toContain("total 0");
+		expect(text).toContain("Recent decisions (last 24h 00m):");
+	});
+
+	test("reads armed once a judge model is authorized, so NOT READY means something", () => {
+		const base = baseInput(makeRoot());
+		const configured = resolveConfig(
+			[
+				{
+					scope: "user",
+					filePath: path.join(base.resolved.paths.agentDir, "smart-approve.yml"),
+					data: { judge: { authorizedModels: ["openai/gpt-fast"] } },
+					rawContent: "judge: {}",
+				},
+			],
+			[],
+			base.resolved.paths,
+		);
+		const text = renderStatus({ ...base, resolved: configured }).join("\n");
+		expect(text).toContain("Gate: armed");
+		expect(text).not.toContain("NOT READY");
+	});
+
+	test("layers really are printed lowest precedence first", () => {
+		const base = baseInput(makeRoot());
+		const userFile = path.join(base.resolved.paths.home, "user.yml");
+		const projectFile = path.join(base.resolved.paths.cwd, "project.yml");
+		const resolved = resolveConfig(
+			[
+				{ scope: "user", filePath: userFile, data: { sensitivity: { fallback: "strict" } }, rawContent: "u" },
+				{
+					scope: "project",
+					filePath: projectFile,
+					data: { sensitivity: { fallback: "permissive" } },
+					rawContent: "p",
+				},
+			],
+			[],
+			base.resolved.paths,
+		);
+		// The project layer won, so it is the higher-precedence one...
+		expect(resolved.config.sensitivity.fallback).toBe("permissive");
+
+		const lines = renderStatus({ ...base, resolved });
+		// ...and the heading promises the loser is printed first.
+		const userIndex = lines.findIndex(line => line.includes(userFile));
+		const projectIndex = lines.findIndex(line => line.includes(projectFile));
+		expect(userIndex).toBeGreaterThan(0);
+		expect(userIndex).toBeLessThan(projectIndex);
+		expect(lines.join("\n")).toContain("Configuration layers (lowest precedence first):");
+	});
+
+	test("the sensitivity precedence line matches how sensitivity is actually resolved", () => {
+		const base = baseInput(makeRoot());
+		const resolved = resolveConfig(
+			[
+				{
+					scope: "user",
+					filePath: path.join(base.resolved.paths.home, "user.yml"),
+					data: {
+						sensitivity: {
+							fallback: "permissive",
+							byTool: { write: "balanced" },
+							byRisk: { "destructive-action": "strict" },
+						},
+					},
+					rawContent: "u",
+				},
+			],
+			[],
+			base.resolved.paths,
+		);
+
+		// "risk override > tool override > fallback", asked of the resolver the gate
+		// uses, so the printed ordering cannot drift from the applied ordering.
+		expect(effectiveSensitivity(resolved.config, "write", "destructive-action")).toBe("strict");
+		expect(effectiveSensitivity(resolved.config, "write")).toBe("balanced");
+		expect(effectiveSensitivity(resolved.config, "read")).toBe("permissive");
+
+		const text = renderStatus({ ...base, resolved }).join("\n");
+		expect(text).toContain("Sensitivity precedence (narrowest wins): risk override > tool override > fallback");
+		expect(text).toContain("fallback:      permissive");
+		expect(text).toContain("by tool:       write=balanced");
+		expect(text).toContain("by risk:       destructive-action=strict");
+	});
+
+	test("says unknown tools are NOT judged only when they really are not", () => {
+		const base = baseInput(makeRoot());
+		expect(renderStatus(base).join("\n")).toContain("unknown tools: judged");
+
+		const relaxed = resolveConfig(
+			[
+				{
+					scope: "project",
+					filePath: path.join(base.resolved.paths.cwd, "p.yml"),
+					data: { scope: { judgeUnknownTools: false } },
+					rawContent: "p",
+				},
+			],
+			[],
+			base.resolved.paths,
+		);
+		expect(relaxed.config.scope.judgeUnknownTools).toBe(false);
+		expect(renderStatus({ ...base, resolved: relaxed }).join("\n")).toContain("unknown tools: NOT judged");
+	});
+
+	test("the unguarded banner names what still blocks instead of claiming nothing does", () => {
+		// A human reading this decides how carefully to work. Overstating the bypass
+		// is as wrong as understating it: deny rules and protected targets still
+		// hard-block while unguarded, and prompt-branch calls are still pre-screened.
+		const text = renderStatus({ ...baseInput(makeRoot()), bypassActive: true }).join("\n");
+		expect(text).toContain("Calls OMP would run unattended are not judged");
+		expect(text).toContain("Deny rules and protected");
+		expect(text).toContain("still pre-screened");
+		expect(text).not.toContain("Smart Approve is disabled");
 	});
 });
 

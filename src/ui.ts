@@ -74,7 +74,11 @@ export interface UiHost {
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-function formatDuration(ms: number): string {
+/**
+ * Human-readable duration. Exported so a command can print the very number a
+ * grant is minted with instead of restating it in prose.
+ */
+export function formatDuration(ms: number): string {
 	if (ms <= 0) return "expired";
 	const totalSeconds = Math.floor(ms / 1000);
 	if (totalSeconds < 60) return `${totalSeconds}s`;
@@ -286,20 +290,28 @@ export interface StatusInput {
 	mainUi: boolean;
 	bypassActive: boolean;
 	database: { path: string; healthy: boolean; detail?: string };
-	openPending: number;
-	aggregate: AuditAggregate;
+	/**
+	 * Counts read from the audit database. Both are `undefined` when that read
+	 * failed: a zero would read as "nothing is waiting" when the truth is "nobody
+	 * knows", and an operator would draw exactly the wrong conclusion.
+	 */
+	openPending?: number;
+	aggregate?: AuditAggregate;
 	aggregateWindowMs: number;
 	now: number;
 }
 
 export function renderStatus(input: StatusInput): string[] {
 	const { resolved, judge, aggregate } = input;
+	const unreadable = "unknown — the audit database could not be read";
 	const config = resolved.config;
 	const lines: string[] = ["SMART APPROVE STATUS", ""];
 
 	if (input.bypassActive) {
 		lines.push(
-			"!! UNGUARDED — Smart Approve is disabled for this session by a human.",
+			"!! UNGUARDED — a human turned judging off for this session.",
+			"   Calls OMP would run unattended are not judged. Deny rules and protected",
+			"   targets still block, and calls OMP prompts about are still pre-screened.",
 			"   Run `/smart-approve guarded` to re-enable it.",
 			"",
 		);
@@ -378,16 +390,21 @@ export function renderStatus(input: StatusInput): string[] {
 
 	lines.push(
 		"",
-		`Open pending approvals: ${input.openPending}` +
-			(input.openPending > 0 ? "  — list them with `/smart-approve pending`" : ""),
+		input.openPending === undefined
+			? `Open pending approvals: ${unreadable}`
+			: `Open pending approvals: ${input.openPending}` +
+					(input.openPending > 0 ? "  — list them with `/smart-approve pending`" : ""),
 	);
 
-	lines.push(
-		"",
-		`Recent decisions (last ${formatDuration(input.aggregateWindowMs)}):`,
-		`  total ${aggregate.total}  allow ${aggregate.allowed}  escalate ${aggregate.escalated}  block ${aggregate.blocked}`,
-		`  avg latency ${Math.round(aggregate.avgLatencyMs)} ms  tokens ${aggregate.inputTokens} in / ${aggregate.outputTokens} out  cost $${aggregate.costUsd.toFixed(4)}`,
-	);
+	lines.push("", `Recent decisions (last ${formatDuration(input.aggregateWindowMs)}):`);
+	if (aggregate === undefined) {
+		lines.push(`  ${unreadable}`);
+	} else {
+		lines.push(
+			`  total ${aggregate.total}  allow ${aggregate.allowed}  escalate ${aggregate.escalated}  block ${aggregate.blocked}`,
+			`  avg latency ${Math.round(aggregate.avgLatencyMs)} ms  tokens ${aggregate.inputTokens} in / ${aggregate.outputTokens} out  cost $${aggregate.costUsd.toFixed(4)}`,
+		);
+	}
 
 	if (resolved.warnings.length > 0) {
 		lines.push("", "Compatibility warnings:");

@@ -1,7 +1,17 @@
 # Accepted-fact coverage
 
 Every accepted fact from `goals/smart-approve/facts.md` (fact-01 … fact-44) and the
-automated evidence that enforces it. Facts are numbered in file order.
+automated evidence that enforces it.
+
+**Facts are numbered by bullet order, not by line number.** The first bullet is on
+line 3, so a fact's number is its line minus two. Citing the line number instead
+is the easiest mistake to make against this file, and it has been made here
+before.
+
+Where a fact names something that was **not** built, the row says so and points at
+the entry in [Deviations](#deviations-and-why) that explains the choice. A row
+with no such marker is implemented in full. Facts 24 and 30 are the only two
+carrying one today.
 
 Ordinary CI runs everything below with no provider credentials. The only
 provider-dependent evidence is the opt-in live evaluation named by facts 42–43.
@@ -37,24 +47,24 @@ bun install --frozen-lockfile && bun run check && bun test && bun run smoke && b
 | 21 | On the auto branch every judge failure escalates then blocks; on the prompt branch it is shown and only OMP's prompt authorizes | `test/gate.test.ts` "every failure stage becomes escalation, never allow", "judge failure is shown in the card and still falls through" |
 | 22 | Execution only after an exact per-call nonce from a real human; every other path blocks | `test/broker.test.ts` "decision binding"; `test/gate.test.ts` "a dialog approval with a wrong nonce is refused"; `test/ui-state.test.ts` |
 | 23 | Interactive escalation shows the literal call, source agent, rationale, risk, and policy | `test/ui-state.test.ts` literal-argument rendering; `scripts/smoke.ts` fast-path scenario |
-| 24 | Headless subagent forwards a frozen escalation to the main-session UI; single-use, nonce-protected, time-limited, exact-call bound | `test/broker.test.ts` "presentation routing" (subagent → main round trip), "grant authority requires the literal call" |
+| 24 | Headless subagent forwards a frozen escalation to the main-session UI; single-use, nonce-protected, time-limited, bound to the exact call, working directory, and policy version | `test/broker.test.ts` "presentation routing" (subagent → main round trip), "grant authority requires the literal call"; `test/store.test.ts` "grants are bound to the working directory they were approved from"; `test/commands.test.ts` "`any change invalidates it` holds for arguments, directory, and policy". **The fact also names a repository binding, which is not implemented** — see deviation 5 |
 | 25 | Synchronous check for a live main handler; no handler blocks immediately and visibly | `test/broker.test.ts` `hasHumanChannel`; `test/gate.test.ts` "with no human channel it persists a pending record and blocks with the review command" |
 | 26 | A headless main means the subagent blocks rather than degrading to allow | `test/broker.test.ts` "a headless main is not a human channel"; `scripts/smoke.ts` "headless escalation blocks" |
 | 27 | Every hard block is visible in audit with agent/parent/tool-call/audit IDs, risk, rationale, timestamp, state | `test/store.test.ts` audit rows and events; `test/gate.test.ts` "audit durability" |
 | 28 | Three blocked attempts in one retry family escalate the sequence; without a channel it stays blocked | `test/gate.test.ts` "exact grants and the loop breaker", "strike exemption is bounded independently of record actionability"; `test/policy.test.ts` "retry families" |
 | 29 | Human override by audit ID and typed challenge; exact-call-bound, single-use, short-lived, invalidated by change | `test/commands.test.ts` override flow; `test/store.test.ts` atomic single-use grant consumption; `test/broker.test.ts` hash-recompute refusal |
-| 30 | Persistent exact allow after a second confirmation, listable and revocable | `test/commands.test.ts` "a persistent grant needs a second explicit confirmation", rule listing and revocation |
-| 31 | Session bypass needs typed confirmation, is session-only, persistently warned, and audited; the model cannot set it | `test/commands.test.ts` bypass challenge/cancel/re-enable; `test/gate.test.ts` "session bypass"; `test/package.test.ts` "no silent kill switch" |
+| 30 | Persistent exact allow after a second confirmation, bound to the approving directory plus policy hash, listable and revocable | `test/commands.test.ts` "a persistent grant needs a second explicit confirmation", "`survives restarts` is true: a persistent grant outlives the database handle", "each scope's printed lifetime is the lifetime the grant receives", rule listing and revocation; `test/store.test.ts` "grants are bound to the working directory they were approved from". **The fact's project-scope default, repository identity, and user-wide opt-in are not implemented** — see deviation 5 |
+| 31 | Session bypass needs typed confirmation, is session-only, persistently warned, and audited; the model cannot set it | `test/commands.test.ts` bypass challenge/cancel/re-enable, "`no environment variable disables it` is true of every env read in src"; `test/gate.test.ts` "session bypass" (including "a bypass does not stop the pre-screen on a call OMP prompts about"); `test/package.test.ts` "no silent kill switch" |
 | 32 | Ordered resolution: deny first, narrow exact allow may skip, broad allow only informs posture, rest are judged | `test/policy.test.ts` "deterministic precedence", "exact allow rules: only a fully specified call may skip the judge", "exact allow binds to a location"; `test/gate.test.ts` "exact allow rule end to end" |
 | 33 | Only a fully specified canonical allow may skip; one wildcard makes it posture | `test/policy.test.ts` "wildcard allows never bypass the judge", "a wildcard target disqualifies even with a matching hash" |
 | 34 | `SMART_APPROVE.md` discovered broadest to most specific and presented as authoritative policy | `test/config.test.ts` "discovery order"; `test/judge.test.ts` policy documents labelled AUTHORITATIVE |
 | 35 | Layered sensitivity; narrowest wins; risk-specific stays strict for a permissive tool; never overrides a deny | `test/config.test.ts` "sensitivity precedence"; `test/gate.test.ts` "per-risk sensitivity tightens once a risk class exists" (including the one-directional property) |
-| 36 | Judge suggestions are constrained, non-binding, previewed, and applied only after confirmation | `test/judge.test.ts` wildcard allow-exact suggestion rejected; `test/commands.test.ts` `apply-suggestion` validation and wildcard downgrade |
+| 36 | Judge suggestions are constrained, non-binding, previewed, and applied only after confirmation | `test/judge.test.ts` wildcard allow-exact suggestion rejected; `test/commands.test.ts` `apply-suggestion` validation and wildcard downgrade, "an exact suggested allow reads advisory and cannot skip the judge" |
 | 37 | Plugin config, policy files, and other active OMP safety-policy files are write-protected by default | `test/config.test.ts` "protected surfaces"; `test/policy.test.ts` "protected policy floor", "the protected floor follows symlinks"; `test/gate.test.ts` "a protected policy write blocks with no judge call" |
 | 38 | Configuration exposes providers, sensitivity, scope, size thresholds, timeouts, escalation, rules, audit | `test/config.test.ts` (schema strictness across every section) |
 | 39 | Commands for status, setup, rules, review, override, and bypass | `test/commands.test.ts` (all nine subcommands); `test/omp-contract.test.ts` "registers exactly one namespaced command" |
 | 40 | Compact redacted audit metadata; no raw arguments, messages, or secrets duplicated | `test/audit-redaction.test.ts` (including a raw-file byte scan of the database and WAL, with a positive control); `test/gate.test.ts` "no raw argument value reaches the audit row"; `scripts/smoke.ts` redaction sweep. **The guard is runtime, not type-level** — see the note below. |
-| 41 | Deterministic tests across scoping, precedence, model selection, isolation, redaction, oversized args, verdicts, fail-closed paths, UI defaults, brokering, nonce/TTL, loop breaking, overrides, bypass, audit redaction | The whole `test/` suite — 774 tests across 19 files |
+| 41 | Deterministic tests across scoping, precedence, model selection, isolation, redaction, oversized args, verdicts, fail-closed paths, UI defaults, brokering, nonce/TTL, loop breaking, overrides, bypass, audit redaction | The whole `test/` suite — 837 tests across 20 files |
 | 42 | Opt-in live evaluation over a versioned adversarial/benign corpus with a machine-readable report | `test/eval-schema.test.ts`; `eval/cases.jsonl` (40 cases, 13 categories); `bun run eval:live -- --help` |
 | 43 | Ordinary CI needs no credentials; live evaluation is opt-in | `test/package.test.ts` "ordinary CI scripts never reference a provider credential"; the release sequence runs green with every provider key unset |
 | 44 | Docs, example deterministic and natural-language policies, and a local smoke check | `README.md`, `examples/smart-approve.yml`, `examples/SMART_APPROVE.md`, `scripts/smoke.ts` (12 scenarios) |
@@ -84,10 +94,41 @@ differently-named field that happens to contain no credential shape passes both
 guards. So when adding a new persisted field, add its name to `FORBIDDEN_KEYS` if
 it can carry model input — nothing will warn you otherwise.
 
-## Deviations from the plan, and why
+## How operator-facing text is kept true
 
-Three places where the implementation departs from `goals/smart-approve/plan.md`.
-Each was a plan assumption that did not survive contact with OMP 17.2.4.
+A sentence shown to a human is a claim about behavior, and a security tool that
+prints a false one is worse than a silent one: it is read at the moment of
+authorization. `expect(out).toContain("...")` does not check a sentence — it
+checks that a sentence was printed.
+
+Three habits, in order of strength:
+
+1. **Derive the text from the predicate the behavior uses.** `rulePosture`
+   (`src/commands.ts`) re-applies `matchExactAllow`'s own conditions and names
+   each missing field, so a rule label cannot drift from what the gate will do.
+   `GRANT_SCOPE_OPTIONS[].ttlMs` is the single source of a grant's lifetime: the
+   duration in the dialog and the expiry written to the database come from the
+   same function.
+2. **Seed the counterexample the sentence excludes.** "Invalidated 1 outstanding
+   allow grant(s)" is only meaningful with a spent and a lapsed grant also in the
+   table. "Every scope is single use" is only meaningful if the test consumes a
+   *session* grant twice.
+3. **Print nothing you did not read.** `status` leaves its counts `undefined`
+   when the database read throws, because "0 waiting" is a fabrication at the one
+   moment nothing is known.
+
+**The residual, stated plainly:** these are per-sentence tests, not a property.
+A new sentence gets no test unless someone writes one. The cheapest guard is to
+avoid nouns that are not types — an earlier draft said "deny grants are
+untouched", and `Grant` has no kind, so `grep -c deny src/contracts.ts` would
+have caught it before any test ran.
+
+## Deviations, and why
+
+Five places where the implementation departs from what was written down. The
+first four are `goals/smart-approve/plan.md` assumptions that did not survive
+contact with OMP 17.2.4. The fifth is a deliberate narrowing of two accepted
+facts.
 
 ### 1. `--auto-approve` is not observable through settings
 
@@ -125,9 +166,10 @@ An `allow-exact` rule now skips the judge only when all three hold:
 The last two exist because the arguments hash is location-blind:
 `write {path: "src/a.ts"}` and `bash {command: "scripts/x.sh"}` both hash
 identically in every checkout, so a user-scoped rule without them would fire
-everywhere. The `cwd` binding is what actually delivers fact-30's repository and
-working-directory identity — the target check alone is not enough for command
-tools, whose resolved target is the executable exactly as typed. An
+everywhere. The `cwd` binding is what delivers fact-30's working-directory
+identity; there is no repository identity, by choice — see deviation 5. The
+target check alone is not enough for command tools, whose resolved target is the
+executable exactly as typed. An
 `allow-exact` rule missing any of the three degrades to an advisory posture hint.
 Evidence: `test/policy.test.ts` "exact allow binds to a location, not just an
 arguments hash"; `test/gate.test.ts` "a pinned allow is bound to its working
@@ -177,3 +219,43 @@ The tightening is one-directional by construction: a permissive per-risk overrid
 can never turn a block or an escalation into an allow, and no sensitivity setting
 overrides a deterministic deny. Evidence: `test/gate.test.ts` "per-risk
 sensitivity tightens once a risk class exists".
+
+### 5. Approval is bound to one directory, not to a repository, and never to everything
+
+Two accepted facts name a breadth of approval that was not built:
+
+- **fact-24** binds approval to "the exact call, repository, working directory,
+  and policy version".
+- **fact-30** says a persisted allow "defaults to project scope, includes
+  repository and working-directory identity plus policy hash, requires explicit
+  opt-in for user-wide scope".
+
+A `Grant` carries `argumentsHash`, `policyHash`, and `cwd`. There is no
+repository field and no repository detection anywhere in `src` — no git-root
+walk, no `.git` lookup. There is no user-wide option, and no way to widen a grant
+past the directory it was approved from.
+
+`cwd` is the working directory of the OMP session that approved the call
+(`ctx.cwd`), so the shipped rule is: **an approval granted from one directory does
+not authorize the same call from another**, including a subdirectory of the same
+repository. That is deliberate. Approving a command where you are standing is not
+the same as approving it everywhere in a checkout, and the audit database is
+shared by every project on the machine.
+
+Both omissions are narrower than the fact, never wider:
+
+- repository scope would admit the call from anywhere under the repository root;
+  directory scope admits it from one directory.
+- user-wide scope would admit it from anywhere at all; there is no such scope to
+  opt into.
+
+No call the facts would have blocked is admitted. The cost runs the other way and
+is small, because a grant only ever admits **one** call: approve out-of-band with
+`/smart-approve override`, relaunch OMP from a different directory of the same
+project, and the agent's identical retry raises one more approval prompt instead
+of running. Evidence for the shipped behavior: `test/store.test.ts` "grants are
+bound to the working directory they were approved from".
+
+A user-wide grant remains **unbuilt on purpose**. It is the one item in the facts
+that would let a single approval follow an agent into every project on the
+machine, and its absence is what keeps grants from leaking between checkouts.

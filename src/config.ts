@@ -48,7 +48,7 @@ const ruleSchema = z
 		 * Pins an `allow-exact` rule to one literal call. Copy it from an audit row
 		 * (`/smart-approve review <audit-id>`).
 		 *
-		 * Fact 35 disqualifies an allow with any omitted argument, and a rule naming
+		 * Fact 33 disqualifies an allow with any omitted argument, and a rule naming
 		 * only tool+target leaves the payload unspecified — a `write` rule naming a
 		 * path alone would permit arbitrary content at that path. So an allow-exact
 		 * rule skips the judge only with this hash; without it the rule is advisory
@@ -65,8 +65,9 @@ const ruleSchema = z
 		 * The arguments hash alone is location-blind: `bash {command: "scripts/x.sh"}`
 		 * and `write {path: "src/a.ts"}` both hash identically in every checkout, so a
 		 * user-scoped rule without this would authorize the call everywhere. Fact 30
-		 * requires a persisted allow to carry repository and working-directory
-		 * identity; this is that identity.
+		 * requires a persisted allow to carry working-directory identity; this is
+		 * that identity. The same fact also names a repository identity, which is
+		 * deliberately not built — see `docs/fact-coverage.md` deviation 5.
 		 */
 		cwd: z.string().min(1).optional(),
 		reason: z.string().min(1).default("no reason given"),

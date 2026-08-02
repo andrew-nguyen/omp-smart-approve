@@ -551,9 +551,8 @@ human answers:
 
 **No path converts unavailability into approval.** There is deliberately no
 configuration key, environment variable, or flag that silently disables the
-plugin. The only way to stop enforcement is
-[`/smart-approve unguarded`](#bypass), which is loud, typed, session-scoped, and
-audited.
+plugin. The only off switch is [`/smart-approve unguarded`](#bypass), which is
+loud, typed, session-scoped, audited, and narrower than it sounds.
 
 ### Retry loops
 
@@ -655,8 +654,8 @@ A task subagent typically has no UI of its own. When one of its calls escalates:
 3. You see the literal pending call, its arguments, the source agent, the judge
    rationale, the risk classes, and the matching policy — then decide.
 4. Approval is **single-use, nonce-protected, time-limited, and bound to the
-   exact call**, plus repository, working directory, and policy version. Change
-   any of those and the grant does not match.
+   exact call**, plus the working directory it was approved from and the policy
+   version. Change any of those and the grant does not match.
 
 Dialogs are serialized FIFO by OMP's extension UI controller, so concurrent
 subagent escalations queue rather than interleave. Status stays visible by
@@ -726,7 +725,14 @@ The blocked model separately receives an actionable reason.
 /smart-approve unguarded
 ```
 
-Turns enforcement off for the current session. It requires:
+Stops Smart Approve judging the calls OMP would otherwise run unattended, for
+this session only. It is narrower than "off":
+
+- **deny rules and protected targets still hard-block**, and
+- **calls OMP prompts you about are still pre-screened**, so a judge block on
+  that branch still stops the call.
+
+It requires:
 
 - a **typed random challenge** — you retype a generated string, so it cannot be
   a reflex;
@@ -820,10 +826,14 @@ arguments to still be in the broker with a matching recomputed hash. When they
 are gone — `brokerArgsTtl` expiry, restart, subagent teardown — it records
 intent-to-approve instead, and says so.
 
-Grants carry a scope: one-time, session, or persistent. A persistent allow
-requires a second explicit confirmation, defaults to project scope, records
-repository and working-directory identity plus the policy hash, and needs
-explicit opt-in for user-wide scope. All grants remain listable and revocable.
+Grants carry a scope: one-time, session, or persistent. Scope chooses **how long
+an unused grant stays valid** and nothing else — every grant is single-use at
+every scope, because the gate admits a call by consuming it. A one-time grant
+lapses with the in-memory call, a session grant with the pending-approval TTL,
+and a persistent grant after 90 days; the persistent one also requires a second
+explicit confirmation. Every grant records the working directory it was approved
+from plus the policy hash, in every scope — there is no wider variant to opt into.
+All grants remain listable and revocable.
 
 **Grants are bound to the working directory they were approved from.** The audit
 database lives in the user-level agent directory and is shared by every project,

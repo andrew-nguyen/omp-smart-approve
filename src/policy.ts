@@ -558,8 +558,8 @@ export function matchDeny(
 /**
  * The one config rule that may skip the judge, or `undefined`.
  *
- * Fact 35 permits a judge bypass only for a "fully specified canonical allow with
- * no wildcard, regex, capture, or omitted argument", and fact 32 requires the
+ * Fact 33 permits a judge bypass only for a "fully specified canonical allow with
+ * no wildcard, regex, capture, or omitted argument", and fact 30 requires the
  * grant to carry working-directory identity. Both are enforced here:
  *
  * - `argumentsHash` must pin the literal call. A rule naming tool and target

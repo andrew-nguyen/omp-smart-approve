@@ -24,12 +24,14 @@ import {
 	configCandidates,
 	type ResolvedConfig,
 	ruleSpecificity,
+	type SmartApproveConfig,
 	smartApproveConfigSchema,
 } from "./config.ts";
 import type { AuditEventType, GrantScope, PolicyRule, RuleKind, RuleSuggestion } from "./contracts.ts";
 import { isExactTarget } from "./policy.ts";
 import type { AuditAggregate, SmartApproveStore } from "./store.ts";
 import {
+	formatDuration,
 	type ReviewInput,
 	renderPendingList,
 	renderReview,
@@ -184,11 +186,42 @@ export function rulePosture(rule: PolicyRule): string {
 		: `advisory posture — still judged (${missing.join(", ")})`;
 }
 
-/** Grant scopes an operator may pick, narrowest first. Labels are the select wire format. */
-export const GRANT_SCOPE_OPTIONS: ReadonlyArray<{ label: string; scope: GrantScope; description: string }> = [
-	{ label: "One time", scope: "one-time", description: "Single use, expires with the in-memory call." },
-	{ label: "This session", scope: "session", description: "Reusable until the pending-approval TTL runs out." },
-	{ label: "Persistent", scope: "persistent", description: "Survives restarts. Needs a second confirmation." },
+/**
+ * Grant scopes an operator may pick, narrowest first. Labels are the select wire
+ * format, so they are part of the contract.
+ *
+ * `ttlMs` is the single source of a scope's lifetime: the duration a human reads
+ * in the dialog and the expiry the grant is minted with both come from it, so the
+ * number on screen cannot drift from the number in the database.
+ *
+ * Scope chooses lifetime and nothing else. Every grant is single-use whatever the
+ * scope, because the gate admits a call by *consuming* the grant.
+ */
+export const GRANT_SCOPE_OPTIONS: ReadonlyArray<{
+	label: string;
+	scope: GrantScope;
+	ttlMs: (timeouts: SmartApproveConfig["timeouts"]) => number;
+	/** Why the lifetime is what it is, in the operator's terms. */
+	lifetime: string;
+}> = [
+	{
+		label: "One time",
+		scope: "one-time",
+		ttlMs: timeouts => timeouts.brokerArgsTtlMs,
+		lifetime: "lapses with the in-memory call",
+	},
+	{
+		label: "This session",
+		scope: "session",
+		ttlMs: timeouts => timeouts.pendingApprovalTtlMs,
+		lifetime: "lapses with the pending-approval TTL",
+	},
+	{
+		label: "Persistent",
+		scope: "persistent",
+		ttlMs: () => PERSISTENT_GRANT_TTL_MS,
+		lifetime: "survives restarts",
+	},
 ];
 
 /** Override actions. Labels are the select wire format, so they are part of the contract. */
@@ -247,8 +280,8 @@ function usage(): string[] {
 		"  review <audit-id>         one call's verdict, history, and options",
 		"  apply-suggestion <id>     apply a judge-proposed rule after confirmation",
 		"  override <audit-id>       approve, deny, or expire a blocked call",
-		"  unguarded                 disable the gate for this session only",
-		"  guarded                   re-enable the gate immediately",
+		"  unguarded                 stop judging unattended calls, this session only",
+		"  guarded                   resume judging immediately",
 	];
 }
 
@@ -345,18 +378,11 @@ function status(deps: CommandDeps): CommandResult {
 	else if (authorized.length === 0) detail = "no judge model authorized — run `/smart-approve setup`";
 	else detail = `authorized models are not available in this session: ${authorized.join(", ")}`;
 
-	const empty: AuditAggregate = {
-		total: 0,
-		allowed: 0,
-		escalated: 0,
-		blocked: 0,
-		avgLatencyMs: 0,
-		inputTokens: 0,
-		outputTokens: 0,
-		costUsd: 0,
-	};
-	let aggregate = empty;
-	let openPending = 0;
+	// Left undefined on failure, never defaulted to zero: `status` is where an
+	// operator checks whether anything is waiting, and a fabricated zero there
+	// reads as "all clear" at the exact moment nothing is known.
+	let aggregate: AuditAggregate | undefined;
+	let openPending: number | undefined;
 	let healthy = true;
 	let dbDetail: string | undefined;
 	try {
@@ -384,8 +410,8 @@ function status(deps: CommandDeps): CommandResult {
 			healthy,
 			...(dbDetail === undefined ? {} : { detail: dbDetail }),
 		},
-		openPending,
-		aggregate,
+		...(openPending === undefined ? {} : { openPending }),
+		...(aggregate === undefined ? {} : { aggregate }),
 		aggregateWindowMs: AGGREGATE_WINDOW_MS,
 		now,
 	};
@@ -750,9 +776,16 @@ async function override(deps: CommandDeps, auditId: string): Promise<CommandResu
 		return { lines };
 	}
 
+	const timeouts = deps.resolved.config.timeouts;
 	const scopeLabel = await deps.ui.select(
 		`Grant scope for ${auditId}`,
-		GRANT_SCOPE_OPTIONS.map(option => ({ label: option.label, description: option.description })),
+		GRANT_SCOPE_OPTIONS.map(option => ({
+			label: option.label,
+			// Single use is not a property of the narrow scopes: the gate consumes
+			// whichever grant admits a call, so scope only chooses the lifetime of a
+			// grant nothing has used yet.
+			description: `Single use; ${option.lifetime} (${formatDuration(option.ttlMs(timeouts))}).`,
+		})),
 	);
 	const selected = GRANT_SCOPE_OPTIONS.find(option => option.label === scopeLabel);
 	if (selected === undefined) {
@@ -763,7 +796,8 @@ async function override(deps: CommandDeps, auditId: string): Promise<CommandResu
 	if (selected.scope === "persistent") {
 		const second = await deps.ui.confirm(
 			"Persistent allow",
-			`A persistent grant survives restarts. Confirm a persistent allow for ${auditId}?`,
+			`A persistent grant survives restarts and stays usable for ${formatDuration(selected.ttlMs(timeouts))}` +
+				` unless something consumes it first. Confirm a persistent allow for ${auditId}?`,
 		);
 		if (!second) {
 			lines.push("A persistent allow needs a second explicit confirmation. Nothing was granted.");
@@ -771,13 +805,7 @@ async function override(deps: CommandDeps, auditId: string): Promise<CommandResu
 		}
 	}
 
-	const ttlMs =
-		selected.scope === "one-time"
-			? deps.resolved.config.timeouts.brokerArgsTtlMs
-			: selected.scope === "session"
-				? deps.resolved.config.timeouts.pendingApprovalTtlMs
-				: PERSISTENT_GRANT_TTL_MS;
-	const expiresAt = now + ttlMs;
+	const expiresAt = now + selected.ttlMs(timeouts);
 
 	deps.store.putGrant({
 		id: deps.randomId(),
@@ -811,8 +839,8 @@ async function override(deps: CommandDeps, auditId: string): Promise<CommandResu
 
 	lines.push(
 		`Granted a ${selected.scope} allow bound to call hash ${authority.frozenCall.argumentsHash}.`,
-		`Expires ${new Date(expiresAt).toISOString()}.`,
-		"Any change to the arguments, configuration, or policy invalidates it.",
+		`Single use: the first matching call consumes it. Unused, it expires ${new Date(expiresAt).toISOString()}.`,
+		"Any change to the arguments, the working directory, the configuration, or the policy invalidates it.",
 		`Reason recorded: ${reason}`,
 	);
 	return { lines };
@@ -824,7 +852,7 @@ async function override(deps: CommandDeps, auditId: string): Promise<CommandResu
 
 async function unguarded(deps: CommandDeps): Promise<CommandResult> {
 	const challenge = deps.randomChallenge();
-	const typed = await deps.ui.input(`Type ${challenge} to run this session with Smart Approve disabled`, challenge);
+	const typed = await deps.ui.input(`Type ${challenge} to stop judging unattended calls in this session`, challenge);
 	if (typed !== challenge) {
 		return {
 			lines: [
@@ -834,24 +862,27 @@ async function unguarded(deps: CommandDeps): Promise<CommandResult> {
 		};
 	}
 
-	const reasonInput = await deps.ui.input("Why are you disabling Smart Approve?", "reason");
+	const reasonInput = await deps.ui.input("Why are you turning judging off?", "reason");
 	const reason = reasonInput === undefined || reasonInput.trim() === "" ? "(no reason given)" : reasonInput.trim();
 	deps.bypass.enable(reason);
 
 	deps.ui.setWidget(WIDGET_BYPASS, [
 		"!! SMART APPROVE IS UNGUARDED !!",
-		"Every tool call runs without semantic screening.",
+		"Calls OMP would run unattended are no longer judged.",
+		"Deny rules and protected targets still block.",
 		`Reason: ${reason}`,
 		"This applies to the current session only. Re-enable with `/smart-approve guarded`.",
 	]);
-	deps.ui.setStatus(STATUS_KEY, "UNGUARDED — Smart Approve is disabled for this session");
+	deps.ui.setStatus(STATUS_KEY, "UNGUARDED — calls OMP would run unattended are not judged");
 	deps.ui.notify("Smart Approve is UNGUARDED for this session.", "error");
 
 	const auditId = recordOperatorEvent(deps, "bypass-enabled", "bypass", `session bypass enabled; reason: ${reason}`);
 	return {
 		lines: [
 			"Smart Approve is UNGUARDED for this session.",
-			"Nothing is being screened. The bypass ends when this session ends.",
+			"Calls OMP would run unattended are no longer judged.",
+			"Still enforced: deny rules, protected targets, and the pre-screen on calls OMP prompts about.",
+			"The bypass ends when this session ends.",
 			`Reason: ${reason}`,
 			`Audit ID: ${auditId}`,
 			"Re-enable immediately with `/smart-approve guarded`.",
