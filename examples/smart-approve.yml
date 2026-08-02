@@ -1,0 +1,329 @@
+# Smart Approve — example configuration
+#
+# Copy to one of:
+#   <agentDir>/smart-approve.yml   user scope   (lowest precedence)
+#   .omp/smart-approve.yml         project scope
+#   ./smart-approve.yml            project scope (highest precedence)
+#
+# Layers merge section by section; a later layer overrides only the keys it
+# names. `rules` arrays concatenate across layers — a project layer cannot
+# delete a user deny rule, only add to it.
+#
+# Unknown keys are rejected. If this file fails to parse or validate, every
+# scoped call fails closed until it is fixed; nothing degrades to "allow".
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Judge
+# ---------------------------------------------------------------------------
+judge:
+  # Explicit allowlist of `provider/model` specs. There is no default. An empty
+  # list means "not set up yet" and every scoped call fails closed with the
+  # setup command in the block reason.
+  #
+  # Judging uses OMP's own model registry and credentials — you do not supply a
+  # separate judge API key here. Only models whose provider already has
+  # configured auth in OMP can actually be selected.
+  authorizedModels:
+    - anthropic/claude-haiku-4-5
+    - openai/gpt-5-mini
+    - google/gemini-2.5-flash
+
+  # Prefer a judge whose model family differs from the primary session model, so
+  # a family-specific jailbreak has to work twice. Falls back to any authorized
+  # model when no contrasting family is available.
+  preferContrastingFamily: true
+
+  # Ceilings on judge output. Anything larger is a malformed verdict, which is a
+  # judge failure — never an allow.
+  maxOutputBytes: 4000
+  maxOutputTokens: 1000
+
+# ---------------------------------------------------------------------------
+# Scope — which calls reach the judge at all
+# ---------------------------------------------------------------------------
+scope:
+  # Always judged regardless of tier. Use for tools whose read tier understates
+  # their reach (anything that can transmit off-machine, and MCP tools whose
+  # semantics live on a server you do not control).
+  alwaysJudge:
+    - web_search
+    - browser
+    - mcp__github__create_pull_request
+    - mcp__notion_update_page
+
+  # Exemptions. Honored ONLY for calls that already prove read tier with no
+  # remote target — listing `bash` or `write` here changes nothing. This is a
+  # narrowing hint, not an escape hatch.
+  neverJudge:
+    - repo_symbol_index
+
+  # Unknown custom/MCP tools cannot prove they are purely local, so they are
+  # scoped by default. Turning this off is a deliberate widening of the gate.
+  judgeUnknownTools: true
+
+  # Above these byte thresholds a call can no longer be silently allowed from a
+  # sample: it requires human escalation. Deterministic scanners still inspect
+  # the complete value and report findings. Tune per tool — a large `write` is
+  # ordinary, a large `bash` command is not.
+  defaultArgumentSizeThreshold: 8000
+  argumentSizeThresholds:
+    write: 24000
+    edit: 16000
+    bash: 4000
+    eval: 4000
+    browser: 4000
+
+# ---------------------------------------------------------------------------
+# Sensitivity — how strict the judge's posture is
+# ---------------------------------------------------------------------------
+# Narrowest applicable setting wins: byRisk beats byTool beats fallback. The
+# two overrides apply at different moments, because they must:
+#
+#   byTool  resolves BEFORE the judge runs and becomes the posture it is given.
+#           No risk class exists yet, so nothing narrower is available.
+#   byRisk  resolves AFTER the verdict names a risk class. When the risk-specific
+#           level is STRICTER than the posture the judge had, an `allow` is
+#           downgraded to an escalation for that call.
+#
+# The tightening is one-directional: a permissive byRisk entry can never turn a
+# block or an escalation into an allow. No sensitivity setting overrides a
+# deterministic deny or supplies a missing verdict.
+sensitivity:
+  fallback: balanced
+
+  # Per-tool override: shell and arbitrary code execution get no benefit of the
+  # doubt even in an otherwise balanced project.
+  byTool:
+    bash: strict
+    eval: strict
+
+  # Per-risk override: risk-specific policy stays strict even for a tool you
+  # made permissive — set `fallback: permissive` with `exfiltration: strict` and
+  # an exfiltration-classed allow still becomes an escalation. Valid keys are
+  # the taxonomy classes: prompt-injection, exfiltration, destructive-action,
+  # wrong-target, policy-violation, safety-tampering, uncertain.
+  byRisk:
+    exfiltration: strict
+    safety-tampering: strict
+    destructive-action: strict
+    prompt-injection: strict
+
+# ---------------------------------------------------------------------------
+# Timeouts — all values are milliseconds
+# ---------------------------------------------------------------------------
+# These are the defaults, spelled out. The plugin refuses to start with a
+# budget that cannot finish inside OMP's 30s tool-call handler cap; it names the
+# offending fields rather than silently clamping them.
+timeouts:
+  targetLatencyMs: 5000 # observability target, not a cutoff
+  modelTimeoutMs: 10000 # hard per-attempt boundary
+  attempts: 2 # 2 = one retry for transient provider failures
+  cleanupMarginMs: 1000 # reserved for the durable audit write
+  handlerSelfDeadlineMs: 28000 # our cap, strictly under OMP's 30000
+
+  # Best-effort in-handler dialog. Skipped entirely when the remaining budget
+  # is below the floor — a two-second window is not long enough to read a
+  # literal call, and a rushed dialog is worse than an async escalation.
+  dialogMaxMs: 20000
+  dialogFloorMs: 10000
+
+  # Clock 1: how long the literal frozen arguments survive in memory. This
+  # gates whether an approval can be MINTED into a grant. After it expires,
+  # approval degrades to recorded intent — never a grant.
+  brokerArgsTtlMs: 600000 # 10 minutes
+
+  # Clock 2: how long an audit ID stays actionable at all. This gates whether
+  # /smart-approve review and /smart-approve override work on the record.
+  # Must be >= brokerArgsTtlMs.
+  pendingApprovalTtlMs: 86400000 # 24 hours
+
+  # A pending human decision suppresses loop-breaker strikes, but only inside
+  # these bounds — a deliberating human never buys the agent unlimited retries.
+  strikeExemptionWindowMs: 600000
+  maxExemptAttempts: 10
+
+  # How long a headless subagent waits for the main session before blocking.
+  subagentEscalationTimeoutMs: 15000
+
+# ---------------------------------------------------------------------------
+# Audit
+# ---------------------------------------------------------------------------
+audit:
+  enabled: true
+  sessionEntries: true # compact redacted entry in session history per decision
+  # databasePath: /custom/path/state.sqlite   # default: <agentDir>/smart-approve/state.sqlite
+  busyTimeoutMs: 5000
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+ui:
+  riskCardOnNativePrompt: true # companion card beside OMP's own prompt
+  fastPathDialog: true # attempt the in-handler dialog when budget allows
+
+# ---------------------------------------------------------------------------
+# Deterministic rules
+# ---------------------------------------------------------------------------
+# Evaluated before any model call, in this order:
+#   protected policy files -> deny rules -> credential-file reads -> scope.
+#
+# `target` is a glob by default (`**` crosses separators, `*` does not, `?` is
+# one character), or a regex when prefixed with `re:`. A target is tested
+# against both the literal string the agent wrote and its resolved absolute
+# form, so prefer `**/x/**` over `x/**` — the latter misses absolute paths.
+# `tool: "*"` matches every tool.
+#
+# IMPORTANT — deny rules on shell calls can only name the EXECUTABLE. Smart
+# Approve extracts the leading command of each `;`/`&&`/`||`/`|` segment plus
+# any literal URL operand; it deliberately does not parse flags, because a rule
+# that thinks it understands shell quoting is a rule with a bypass in it. So
+# `target: terraform` works and `target: "re:^terraform apply"` matches nothing.
+# Argument-level semantics — `--force`, `--context prod`, a computed path — are
+# exactly what the judge is for.
+#
+# On allow rules, read the note above `allow-verify-ledger` before adding one.
+rules:
+  # -- Deny: secrets and credential material -------------------------------
+  - id: deny-dotenv
+    kind: deny-pattern
+    tool: "*"
+    target: "**/.env*"
+    risk: exfiltration
+    reason: Environment files hold credentials; nothing in this repo needs to read or write them.
+
+  - id: deny-ssh-material
+    kind: deny-pattern
+    tool: "*"
+    target: "**/.ssh/**"
+    risk: exfiltration
+    reason: Private key material is never a legitimate agent target.
+
+  - id: deny-cloud-credentials
+    kind: deny-pattern
+    tool: "*"
+    target: "re:.*/\\.(aws|kube|docker|gnupg)/.*"
+    risk: exfiltration
+    reason: Cloud and cluster credentials are out of bounds for automated work.
+
+  # -- Deny: executables that are never appropriate from a session ---------
+  # Blunt on purpose: see the note above. If some invocations of a tool are
+  # legitimate, do not deny the executable — let the judge read the arguments.
+  - id: deny-terraform
+    kind: deny-exact
+    tool: bash
+    target: terraform
+    operation: bash
+    risk: destructive-action
+    reason: Infrastructure changes go through the reviewed pipeline, never from an agent shell.
+
+  - id: deny-kubectl
+    kind: deny-exact
+    tool: bash
+    target: kubectl
+    operation: bash
+    risk: wrong-target
+    reason: This project has no cluster operation an agent session should perform directly.
+
+  # `git` itself is essential, so it is NOT denied here. Force-pushes, remote
+  # branch deletion, and history rewrites are judged, and the natural-language
+  # policy in SMART_APPROVE.md tells the judge to treat them as irreversible.
+
+  # -- Deny: egress to destinations we never use ---------------------------
+  - id: deny-paste-sites
+    kind: deny-pattern
+    tool: "*"
+    target: "re:^https?://(pastebin\\.com|paste\\.ee|transfer\\.sh|file\\.io|0x0\\.st)/"
+    risk: exfiltration
+    reason: Anonymous paste and file-drop hosts are exfiltration destinations, not dependencies.
+
+  - id: deny-raw-ip-egress
+    kind: deny-pattern
+    tool: "*"
+    target: "re:^https?://\\d+\\.\\d+\\.\\d+\\.\\d+(:\\d+)?/"
+    risk: exfiltration
+    reason: A bare-IP destination has no reviewable identity.
+
+  # -- Deny: safety-control tampering --------------------------------------
+  # The plugin's own config/policy files, OMP's settings.yml and secrets.yml,
+  # and the audit database are already protected by the built-in deny floor.
+  # This rule covers the CI checks that enforce the same rules outside OMP.
+  - id: deny-ci-policy-edits
+    kind: deny-pattern
+    tool: "*"
+    target: "**/.github/workflows/**"
+    risk: safety-tampering
+    reason: Workflow files gate merges; changing them from an agent session removes the check that would catch it.
+
+  # -- Posture: tighten judgment without blocking --------------------------
+  # A posture rule never allows or blocks. It raises the judge's strictness for
+  # calls that match, which is the right tool when "usually fine, occasionally
+  # catastrophic" describes the surface.
+  - id: posture-migrations
+    kind: posture
+    tool: "*"
+    target: "**/migrations/**"
+    sensitivity: strict
+    risk: destructive-action
+    reason: Schema migrations are effectively irreversible against a populated database.
+
+  # -- Allow-pattern: advisory only, NEVER a bypass -------------------------
+  # A wildcard allow is a posture hint, nothing more. Matching calls are still
+  # judged in full; the judge simply learns that you consider this surface
+  # routine. It cannot skip the judge, by design: `**/.tmp/**` names a directory,
+  # not a call, and says nothing about what would be written there.
+  - id: allow-pattern-scratch
+    kind: allow-pattern
+    tool: write
+    target: "**/.tmp/**"
+    reason: Scratch output under .tmp is routine; treat it as low-friction but still judge it.
+
+  # -- Allow-exact: the only rule shape that can skip the judge -------------
+  # It skips judgment only when ALL THREE of these hold. Omit any one and the
+  # rule degrades to advisory posture: the call is still judged in full.
+  #
+  #   1. `argumentsHash` pins the exact literal call. Copy it from an audit row
+  #      via `/smart-approve review <audit-id>`. Without it, a rule naming only
+  #      tool + target leaves the payload unspecified — `tool: write,
+  #      target: src/app.ts` would permit ANY content at that path.
+  #
+  #   2. `target` equals a RESOLVED, non-dynamic target of the call.
+  #
+  #   3. `cwd` is the absolute working directory the call runs in. This is what
+  #      actually binds the rule to one location. The arguments hash is
+  #      location-blind — `bash {command: "scripts/verify-ledger.sh"}` hashes
+  #      identically in every checkout on the machine — so without `cwd` a
+  #      user-scoped rule would fire in all of them.
+  #
+  # `/smart-approve review <audit-id>` prints the hash, the resolved target, and
+  # the working directory for a real call, so all three come from one place.
+  # After adding the rule, `/smart-approve rules list` tells you whether it
+  # actually qualifies: an incomplete pin reads "advisory posture — still judged"
+  # and names the missing field.
+  #
+  # How `target` resolves, per tool family — this trips people up:
+  #
+  #   - Path tools (write/edit/read): the resolved target is ALWAYS the absolute
+  #     path, so a relative `target:` can never match. Write the absolute path.
+  #   - Command tools (bash): the resolved target is the leading executable
+  #     EXACTLY as typed, relative or absolute. `target: bun` matches `bun ...`
+  #     anywhere, which is precisely why `cwd` is required rather than optional.
+  #   - A target the plugin could not resolve — a glob, a shell substitution, an
+  #     unexpanded variable — is dynamic and can never match. Deliberate: a call
+  #     whose destination we only guessed at must not reach an allow.
+  #
+  # Change the arguments, the target, or the directory and the rule stops
+  # applying. That is the point.
+  #
+  # The hash below is the real hash of
+  # `{"command":"scripts/verify-ledger.sh --dry-run"}`. Yours will differ; do
+  # not copy it.
+  - id: allow-verify-ledger
+    kind: allow-exact
+    tool: bash
+    target: scripts/verify-ledger.sh
+    operation: bash
+    argumentsHash: 072f909c49daff0e40b0fd6d419a1ca2fb513fcd57fe0cbe0d2349fd50e45b9f
+    cwd: /srv/orchid
+    reason: Read-only ledger verification, reviewed once and pinned to its exact arguments and location.

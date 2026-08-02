@@ -1,0 +1,40 @@
+{
+	"name": "omp-smart-approve",
+	"version": "0.1.0",
+	"description": "An LLM safety judge in front of tool calls OMP would otherwise auto-approve. Hard-blocks clear attacks and clear mistakes, escalates genuine uncertainty to a human.",
+	"license": "MIT",
+	"type": "module",
+	"private": false,
+	"keywords": ["omp", "oh-my-pi", "plugin", "extension", "security", "approval", "prompt-injection"],
+	"omp": {
+		"extensions": ["./src/index.ts"]
+	},
+	"exports": {
+		".": "./src/index.ts",
+		"./package.json": "./package.json"
+	},
+	"files": ["src", "examples", "README.md", "LICENSE"],
+	"scripts": {
+		"check": "tsc --noEmit && biome check src test eval scripts",
+		"format": "biome check --write src test eval scripts",
+		"test": "bun test",
+		"smoke": "bun run scripts/smoke.ts",
+		"eval:live": "bun run eval/run.ts",
+		"pack:check": "bun pm pack --dry-run"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": ">=17.2.2 <18"
+	},
+	"dependencies": {
+		"zod": "^4.4.3"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.3.0",
+		"@oh-my-pi/pi-coding-agent": "17.2.4",
+		"@types/bun": "^1.3.0",
+		"typescript": "^5.9.0"
+	},
+	"engines": {
+		"bun": ">=1.3.0"
+	}
+}

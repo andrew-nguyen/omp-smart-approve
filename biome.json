@@ -1,0 +1,45 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.3.0/schema.json",
+	"vcs": { "enabled": false, "clientKind": "git", "useIgnoreFile": true },
+	"files": {
+		"includes": ["src/**/*.ts", "test/**/*.ts", "eval/**/*.ts", "scripts/**/*.ts"]
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab",
+		"indentWidth": 4,
+		"lineWidth": 120
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"suspicious": {
+				"noExplicitAny": "error",
+				"noConsole": { "level": "error", "options": { "allow": ["error", "warn"] } }
+			},
+			"style": {
+				"useConst": "error",
+				"noNonNullAssertion": "error",
+				"useNamingConvention": "off"
+			},
+			"complexity": {
+				"noExcessiveCognitiveComplexity": "off"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double",
+			"semicolons": "always",
+			"trailingCommas": "all",
+			"arrowParentheses": "asNeeded"
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["scripts/**/*.ts", "eval/**/*.ts"],
+			"linter": { "rules": { "suspicious": { "noConsole": "off" } } }
+		}
+	]
+}
