@@ -34,6 +34,7 @@ import {
 	policyCandidates,
 	type ResolvedConfig,
 	resolveConfig,
+	writableConfigPath,
 } from "./config.ts";
 import {
 	buildJudgeInput,
@@ -101,6 +102,35 @@ async function readLayer(scope: "user" | "project", filePath: string): Promise<L
 		throw new Error(`${filePath} is not valid YAML: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	return { scope, filePath, data, rawContent };
+}
+
+/** Narrow to a mergeable mapping: arrays and scalars are replaced, not merged. */
+function asSection(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/**
+ * Fold a written patch into the configuration already on disk, section by
+ * section — the same key-by-key merge layers get at read time.
+ *
+ * Serializing the patch alone would delete every other setting in the file, so
+ * an operator who had tuned sensitivity, rules, or timeouts would lose all of it
+ * the moment they re-ran `setup`. Values survive the YAML round-trip; comments
+ * do not.
+ */
+function mergeConfigPatch(
+	existing: Readonly<Record<string, unknown>>,
+	patch: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+	const merged: Record<string, unknown> = { ...existing };
+	for (const [key, value] of Object.entries(patch)) {
+		const currentSection = asSection(merged[key]);
+		const patchSection = asSection(value);
+		merged[key] = currentSection && patchSection ? mergeConfigPatch(currentSection, patchSection) : value;
+	}
+	return merged;
 }
 
 async function discover(paths: DiscoveryPaths): Promise<ResolvedConfig> {
@@ -215,6 +245,109 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 			setWidget: (key, lines) => ctx.ui.setWidget(key, lines),
 		});
 
+		/**
+		 * Everything the gate derives from configuration, in one place, so the
+		 * startup path and the reconfigure path cannot drift into judging by
+		 * different rules.
+		 */
+		const buildGate = (
+			ctx: ExtensionContext,
+			resolved: ResolvedConfig,
+			store: SmartApproveStore,
+			redactor: Redactor,
+			tracker: ProvenanceTracker,
+		): Gate => {
+			const judgePorts: JudgePorts = {
+				listModels: () => ctx.models.list(),
+				currentModel: () => ctx.models.current(),
+				resolveModel: spec => ctx.models.resolve(spec),
+				family: model => ctx.models.family(model),
+				hasConfiguredAuth: model => ctx.modelRegistry.hasConfiguredAuth(model),
+				getApiKey: async (model, sessionId) => (await ctx.modelRegistry.getApiKey(model, sessionId)) ?? "",
+				complete: async (model, context, options) => {
+					const { completeSimple } = await import("@oh-my-pi/pi-ai");
+					return completeSimple(model, context, options);
+				},
+				now,
+			};
+			const realJudge = createJudge({ config: resolved.config, ports: judgePorts });
+
+			const ports: GatePorts = {
+				classifyHostApproval: async () => ({ branch: "unsupported", reason: "unused" }),
+				judge: dependencies.judge
+					? (input, signal) => dependencies.judge?.(input, signal) ?? Promise.reject(new Error("no judge"))
+					: (input, signal) => realJudge(input, signal, randomId()),
+				escalate: createApprovalPresenter(uiFor(ctx), now),
+				now,
+				randomNonce,
+				randomId,
+			};
+
+			return new Gate({
+				resolved,
+				store,
+				ports,
+				buildJudgeInput: (request, context) =>
+					buildJudgeInput({
+						toolName: request.toolName,
+						operation: request.canonicalCall.operation,
+						targets: request.canonicalCall.targets,
+						sourceAgentId: request.sourceAgentId,
+						rawArguments: request.rawArguments,
+						threshold: argumentSizeThreshold(resolved.config, request.toolName),
+						redactor,
+						tracker,
+						policyDocuments: resolved.policyDocuments.map(d => d.content),
+						postureHints: context.postureHints,
+						sensitivity: context.sensitivity,
+					}),
+				publishRiskCard: (card: RiskCard) => ctx.ui.setWidget(WIDGET_RISK_CARD, renderRiskCard(card)),
+				bypassActive: () => bypass.active(),
+				recordSuggestion,
+			});
+		};
+
+		/**
+		 * Fold a just-written configuration into the *running* session.
+		 *
+		 * Configuration is read once at `session_start`, so without this a
+		 * successful `setup` changes a file nobody rereads: `status` keeps
+		 * answering "not configured", the status line keeps advertising the
+		 * wizard, and every scoped call keeps failing closed until the operator
+		 * guesses that a restart is required.
+		 *
+		 * The store is deliberately reused. A judgment already in flight holds it,
+		 * and closing it underneath one would turn a configuration edit into a
+		 * spurious block. A configuration that moves the audit database therefore
+		 * still needs a restart, and says so rather than silently splitting the
+		 * session between two databases.
+		 */
+		const rearm = async (ctx: ExtensionContext, active: SessionRuntime): Promise<void> => {
+			const resolved = dependencies.resolveConfiguration
+				? await dependencies.resolveConfiguration(active.resolved.paths)
+				: await discover(active.resolved.paths);
+
+			// Same invariant as startup: a configuration edit invalidates every
+			// outstanding allow grant. Deny rules survive, so tightening never widens
+			// the gate.
+			active.store.revokeGrantsForPolicy(resolved.policyHash, ctx.cwd, now());
+
+			if (resolved.databasePath !== active.resolved.databasePath) {
+				ctx.ui.notify(
+					`Smart Approve keeps auditing to ${active.resolved.databasePath} until this session restarts;` +
+						` the new configuration names ${resolved.databasePath}.`,
+					"warning",
+				);
+			}
+
+			active.resolved = resolved;
+			active.gate = buildGate(ctx, resolved, active.store, active.redactor, active.tracker);
+			ctx.ui.setStatus(
+				STATUS_KEY,
+				resolved.ready ? undefined : `smart-approve: not configured — /${COMMAND_NAME} setup`,
+			);
+		};
+
 		// ------------------------------------------------------------ session start
 
 		api.on("session_start", async (_event, ctx) => {
@@ -240,55 +373,7 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 				const redactor = dependencies.redactor ?? (await loadSessionRedactor(ctx.cwd, agentDir));
 				const tracker = createProvenanceTracker({ redactor });
 
-				const judgePorts: JudgePorts = {
-					listModels: () => ctx.models.list(),
-					currentModel: () => ctx.models.current(),
-					resolveModel: spec => ctx.models.resolve(spec),
-					family: model => ctx.models.family(model),
-					hasConfiguredAuth: model => ctx.modelRegistry.hasConfiguredAuth(model),
-					getApiKey: async (model, sessionId) => (await ctx.modelRegistry.getApiKey(model, sessionId)) ?? "",
-					complete: async (model, context, options) => {
-						const { completeSimple } = await import("@oh-my-pi/pi-ai");
-						return completeSimple(model, context, options);
-					},
-					now,
-				};
-				const realJudge = createJudge({ config: resolved.config, ports: judgePorts });
-
-				const ports: GatePorts = {
-					classifyHostApproval: async () => ({ branch: "unsupported", reason: "unused" }),
-					judge: dependencies.judge
-						? (input, signal) =>
-								dependencies.judge?.(input, signal) ?? Promise.reject(new Error("no judge"))
-						: (input, signal) => realJudge(input, signal, randomId()),
-					escalate: createApprovalPresenter(uiFor(ctx), now),
-					now,
-					randomNonce,
-					randomId,
-				};
-
-				const gate = new Gate({
-					resolved,
-					store,
-					ports,
-					buildJudgeInput: (request, context) =>
-						buildJudgeInput({
-							toolName: request.toolName,
-							operation: request.canonicalCall.operation,
-							targets: request.canonicalCall.targets,
-							sourceAgentId: request.sourceAgentId,
-							rawArguments: request.rawArguments,
-							threshold: argumentSizeThreshold(resolved.config, request.toolName),
-							redactor,
-							tracker,
-							policyDocuments: resolved.policyDocuments.map(d => d.content),
-							postureHints: context.postureHints,
-							sensitivity: context.sensitivity,
-						}),
-					publishRiskCard: (card: RiskCard) => ctx.ui.setWidget(WIDGET_RISK_CARD, renderRiskCard(card)),
-					bypassActive: () => bypass.active(),
-					recordSuggestion,
-				});
+				const gate = buildGate(ctx, resolved, store, redactor, tracker);
 
 				runtime = {
 					resolved,
@@ -570,18 +655,27 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 						},
 					},
 					writeConfig: async patch => {
-						const target = `${active.resolved.paths.agentDir}/${CONFIG_FILENAME}`;
+						const target = writableConfigPath(active.resolved.paths);
+						// The patch changes one setting; everything else in the file is the
+						// operator's and must survive.
+						const existing = await readLayer("user", target);
+						const merged = mergeConfigPatch(asSection(existing?.data) ?? {}, patch);
 						// Write through a temporary file so a crash mid-write cannot leave a
 						// truncated security configuration behind.
 						const temporary = `${target}.tmp-${randomId()}`;
-						await Bun.write(temporary, Bun.YAML.stringify(patch));
+						await Bun.write(temporary, Bun.YAML.stringify(merged));
 						await Bun.$`mv ${temporary} ${target}`.quiet();
+						// The session read its configuration at startup, so the write only
+						// counts once the running session has taken it up.
+						await rearm(ctx, active);
 						return target;
 					},
 				};
 				const commands = createCommands(deps);
 				const output = await commands.run(args);
-				for (const line of output.lines) ctx.ui.notify(line, "info");
+				// The interactive TUI collapses consecutive status notifications into a
+				// single mutable line, so one notify per line would show only the last.
+				if (output.lines.length > 0) ctx.ui.notify(output.lines.join("\n"), "info");
 			},
 		});
 	};

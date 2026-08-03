@@ -174,9 +174,22 @@ someone's work teaches them to dismiss dialogs, and this plugin's entire value
 depends on dialogs being read.
 
 `setup` lists only models whose provider already has configured credentials in
-OMP, recommends a fast model from a family different from your primary session
-model, previews the config path and the resulting timeout budget, and writes the
-file only after you confirm.
+OMP, then asks you to pick the judge from that list — a fast model from a family
+different from your primary session model is recommended and offered first, but
+any authenticated model is a valid choice. It previews the config path and the
+resulting timeout budget, and writes the file only after you confirm the model
+you picked. Cancelling either the picker or the confirmation writes nothing.
+
+Setup always writes the **user** layer, `<agentDir>/smart-approve.yml`, never a
+project file — authorizing a judge is a per-operator credential decision, so it
+does not land in a file a repository can ship. The path shown in the preview, the
+path named in the confirmation, and the path that changes on disk are the same
+file. The write merges into that file section by section, so hand-written
+settings survive a re-run; YAML comments do not survive the round-trip.
+
+A successful write takes effect immediately. The running session re-resolves its
+configuration, so `status` reports the armed gate and scoped calls are judged
+without restarting OMP.
 
 **Until setup succeeds, the plugin fails closed.** Every scoped call that OMP
 would have auto-approved is blocked, and the block reason names
@@ -821,8 +834,9 @@ All nine subcommands are under one namespaced command, `/smart-approve <sub>`.
 ### `setup`
 
 The only wizard, and it never opens by itself. Lists models with configured
-auth, recommends a fast cross-family model, previews the config path and timeout
-budget, writes atomically after confirmation.
+auth, asks which one to authorize (a fast cross-family model is recommended and
+listed first), previews the config path and timeout budget, writes atomically
+after confirmation.
 
 ### `status`
 

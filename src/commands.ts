@@ -21,12 +21,11 @@
 import path from "node:path";
 import { grantAuthority, hasHumanChannel, heldCall, queueDepth } from "./broker.ts";
 import {
-	CONFIG_FILENAME,
-	configCandidates,
 	type ResolvedConfig,
 	ruleSpecificity,
 	type SmartApproveConfig,
 	smartApproveConfigSchema,
+	writableConfigPath,
 } from "./config.ts";
 import type { AuditEventType, GrantScope, PolicyRule, RuleKind, RuleSuggestion } from "./contracts.ts";
 import { isExactTarget } from "./policy.ts";
@@ -332,11 +331,20 @@ async function setup(deps: CommandDeps): Promise<CommandResult> {
 		currentFamily === undefined ? undefined : models.find(model => deps.models.family(model) !== currentFamily);
 	const recommended = contrasting ?? models[0];
 	if (recommended === undefined) return { lines: ["No model available. Nothing was written."] };
-	const spec = `${recommended.provider}/${recommended.id}`;
+	const specOf = (model: { id: string; provider: string }): string => `${model.provider}/${model.id}`;
+	const recommendedSpec = specOf(recommended);
+	const rest = models.filter(model => specOf(model) !== recommendedSpec);
+	const options = [recommended, ...rest].map(model => ({
+		label: specOf(model),
+		description:
+			specOf(model) === recommendedSpec
+				? `family ${deps.models.family(model)} — recommended${
+						contrasting === undefined ? "" : ": differs from the session model's family"
+					}`
+				: `family ${deps.models.family(model)}`,
+	}));
 
-	const existingLayer = deps.resolved.layers.at(-1)?.filePath;
-	const candidates = configCandidates(deps.resolved.paths);
-	const previewPath = existingLayer ?? candidates[1]?.filePath ?? CONFIG_FILENAME;
+	const previewPath = writableConfigPath(deps.resolved.paths);
 	const budget = deps.resolved.budget;
 	const timeouts = deps.resolved.config.timeouts;
 
@@ -349,7 +357,7 @@ async function setup(deps: CommandDeps): Promise<CommandResult> {
 		`Session model: ${current === undefined ? "(none)" : `${current.provider}/${current.id}`}${
 			currentFamily === undefined ? "" : ` (family ${currentFamily})`
 		}`,
-		`Recommended judge: ${spec}`,
+		`Recommended judge: ${recommendedSpec}`,
 		contrasting === undefined
 			? "  No authorized model from a different family is available; this one shares the session family."
 			: "  Chosen because its family differs from the session model, so one model's blind spot is not both.",
@@ -363,17 +371,34 @@ async function setup(deps: CommandDeps): Promise<CommandResult> {
 			(budget.fastPathStructurallyUnreachable ? " (too short to prompt; escalation is always asynchronous)" : ""),
 	];
 
+	// The picker is the consent step: an operator may authorize any authenticated
+	// model, not just the recommended one. A cancel — or a label that was never
+	// offered — is no consent to anything, so both land on the same no-write path.
+	const chosenLabel = await deps.ui.select("Choose the judge model", options);
+	const chosen = chosenLabel === undefined ? undefined : models.find(model => specOf(model) === chosenLabel);
+	if (chosen === undefined) {
+		return { lines: [...preview, "", "Cancelled. Nothing was written."] };
+	}
+	const spec = specOf(chosen);
+
 	const confirmed = await deps.ui.confirm(
 		"Smart Approve setup",
 		`Write judge.authorizedModels = ["${spec}"] to ${previewPath}?`,
 	);
 	if (!confirmed) {
-		return { lines: [...preview, "", "Cancelled. Nothing was written."] };
+		return { lines: [...preview, "", `Selected judge: ${spec}`, "", "Cancelled. Nothing was written."] };
 	}
 
 	const written = await deps.writeConfig({ judge: { authorizedModels: [spec] } });
 	return {
-		lines: [...preview, "", `Wrote ${written}`, "Run `/smart-approve status` to confirm the gate is armed."],
+		lines: [
+			...preview,
+			"",
+			`Selected judge: ${spec}`,
+			"",
+			`Wrote ${written}`,
+			"Run `/smart-approve status` to confirm the gate is armed.",
+		],
 	};
 }
 

@@ -397,11 +397,90 @@ describe("setup", () => {
 		expect(h.writes).toHaveLength(0);
 	});
 
+	test("declining the write confirmation writes nothing, after a model was picked", async () => {
+		const h = harness({ models: [ANTHROPIC], script: { selects: ["anthropic/claude-fast"], confirms: [false] } });
+		const out = await h.run("setup");
+		expect(h.fake.confirms).toHaveLength(1);
+		expect(out).toContain("Selected judge: anthropic/claude-fast");
+		expect(out).toContain("Cancelled. Nothing was written.");
+		expect(h.writes).toHaveLength(0);
+	});
+
+	test("names the file it actually writes, even when a project layer is loaded", async () => {
+		const userPath = path.join(root, "agent", "smart-approve.yml");
+		const h = harness({
+			models: [ANTHROPIC],
+			script: { selects: ["anthropic/claude-fast"], confirms: [true] },
+			resolvedOverrides: {
+				layers: [
+					{
+						scope: "project",
+						filePath: path.join(root, "project", ".omp", "smart-approve.yml"),
+						contentHash: "c".repeat(64),
+					},
+				],
+			},
+		});
+		const out = await h.run("setup");
+		// The confirmed path is consent: naming a file other than the one the
+		// writer touches would collect consent for a change that never happens.
+		expect(h.fake.confirms[0]?.message).toContain(userPath);
+		expect(out).toContain(`Config file: ${userPath}`);
+		expect(out).toContain(`Wrote ${userPath}`);
+	});
+
 	test("confirming writes exactly the authorized-model patch, once", async () => {
-		const h = harness({ models: [OPENAI, ANTHROPIC], script: { confirms: [true] } });
+		const h = harness({ models: [OPENAI, ANTHROPIC], script: { selects: ["openai/gpt-fast"], confirms: [true] } });
 		const out = await h.run("setup");
 		expect(h.writes).toEqual([{ judge: { authorizedModels: ["openai/gpt-fast"] } }]);
 		expect(out).toContain(path.join(root, "agent", "smart-approve.yml"));
+	});
+
+	test("offers every authenticated model, recommended first and annotated", async () => {
+		const h = harness({
+			models: [OPENAI, ANTHROPIC],
+			current: OPENAI,
+			families: { "openai/gpt-fast": "openai", "anthropic/claude-fast": "anthropic" },
+		});
+		await h.run("setup");
+		expect(h.fake.selects[0]?.title).toBe("Choose the judge model");
+		expect(h.fake.selects[0]?.options.map(option => option.label)).toEqual([
+			"anthropic/claude-fast",
+			"openai/gpt-fast",
+		]);
+		expect(h.fake.selects[0]?.options[0]?.description).toContain(
+			"recommended: differs from the session model's family",
+		);
+	});
+
+	test("picking a model other than the recommendation authorizes the picked one", async () => {
+		const h = harness({
+			models: [OPENAI, ANTHROPIC],
+			current: OPENAI,
+			families: { "openai/gpt-fast": "openai", "anthropic/claude-fast": "anthropic" },
+			script: { selects: ["openai/gpt-fast"], confirms: [true] },
+		});
+		const out = await h.run("setup");
+		expect(h.writes).toEqual([{ judge: { authorizedModels: ["openai/gpt-fast"] } }]);
+		expect(out).toContain("Selected judge: openai/gpt-fast");
+		expect(h.fake.confirms[0]?.message).toContain('["openai/gpt-fast"]');
+	});
+
+	test("cancelling the picker writes nothing and never asks to confirm", async () => {
+		const h = harness({ models: [ANTHROPIC] });
+		const out = await h.run("setup");
+		expect(out).toContain("Cancelled. Nothing was written.");
+		expect(h.writes).toHaveLength(0);
+		expect(h.fake.selects).toHaveLength(1);
+		expect(h.fake.confirms).toHaveLength(0);
+	});
+
+	test("a label that was never offered is treated as cancel, not as consent", async () => {
+		const h = harness({ models: [ANTHROPIC], script: { selects: ["openai/not-offered"], confirms: [true] } });
+		const out = await h.run("setup");
+		expect(out).toContain("Cancelled. Nothing was written.");
+		expect(h.writes).toHaveLength(0);
+		expect(h.fake.confirms).toHaveLength(0);
 	});
 });
 

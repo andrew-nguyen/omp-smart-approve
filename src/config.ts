@@ -393,6 +393,16 @@ export function configCandidates(paths: DiscoveryPaths): Array<{ scope: "user" |
 }
 
 /**
+ * The file `setup` writes to: the user-scope layer, never a project one. An
+ * authorization for a judge model is a per-operator credential decision, so it
+ * never lands in a file a repository can ship. Both the setup preview and the
+ * writer read this, so the path an operator confirms is the path that changes.
+ */
+export function writableConfigPath(paths: DiscoveryPaths): string {
+	return path.join(paths.agentDir, CONFIG_FILENAME);
+}
+
+/**
  * Candidate natural-language policy locations, broadest to most specific.
  * The judge sees them in this order, so a leaf project statement reads last.
  */

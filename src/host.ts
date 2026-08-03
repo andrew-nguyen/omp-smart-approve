@@ -34,7 +34,7 @@
  *    `unsupported`, never an optimistic `auto` or `prompt`.
  */
 
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent";
 import { type ApprovalMode, resolveApproval, resolveToolTier } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import type { HostApproval, ToolTier } from "./contracts.ts";
 

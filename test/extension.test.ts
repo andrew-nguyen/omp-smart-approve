@@ -7,11 +7,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import type { Extension, ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	Extension,
+	ExtensionCommandContext,
+	ExtensionContext,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { resetBrokerForTests } from "../src/broker.ts";
@@ -53,6 +57,10 @@ interface Recorder {
 	notices: string[];
 	selectAnswer: string | undefined;
 	selectCalls: number;
+	/** Answer for every `ui.confirm`. Default `false` keeps dialogs declining. */
+	confirmAnswer: boolean;
+	/** Authenticated models the session exposes; default none. */
+	models: Array<{ id: string; provider: string }>;
 	entries: Array<{ type: string; data: unknown }>;
 }
 
@@ -65,7 +73,7 @@ function makeCtx(recorder: Recorder, hasUI: boolean): ExtensionContext {
 				recorder.selectCalls += 1;
 				return hasUI ? recorder.selectAnswer : undefined;
 			},
-			confirm: async () => false,
+			confirm: async () => recorder.confirmAnswer,
 			input: async () => undefined,
 			notify: (message: string) => recorder.notices.push(message),
 			setStatus: (key: string, text: string | undefined) => recorder.statuses.set(key, text),
@@ -80,7 +88,12 @@ function makeCtx(recorder: Recorder, hasUI: boolean): ExtensionContext {
 		},
 		modelRegistry: { hasConfiguredAuth: () => false, getApiKey: async () => "" },
 		model: undefined,
-		models: { list: () => [], current: () => undefined, resolve: () => undefined, family: () => "x" },
+		models: {
+			list: () => recorder.models,
+			current: () => undefined,
+			resolve: () => undefined,
+			family: (model: { provider: string }) => model.provider,
+		},
 		setInterval: () => 0 as unknown as Timer,
 		setTimeout: () => 0 as unknown as Timer,
 		clearTimer: () => {},
@@ -102,7 +115,10 @@ function registerSession(ctx: ExtensionContext, approvalMode = "yolo"): void {
 		displayName: "Main",
 		kind: "main",
 		session: {
-			settings: { get: (key: string) => settings.get(key) },
+			// Without this the extension falls back to `${HOME}/.omp/agent` and the
+			// suite reads — and, once a command writes config, overwrites — the
+			// developer's real installation.
+			settings: { get: (key: string) => settings.get(key), getAgentDir: () => agentDir },
 			agent: {
 				state: {
 					tools: [
@@ -145,6 +161,10 @@ async function build(
 		resolveOverride?: () => never;
 		skipSessionStart?: boolean;
 		selectAnswer?: string;
+		confirmAnswer?: boolean;
+		models?: Array<{ id: string; provider: string }>;
+		/** Resolve configuration from disk, so a mid-session write is observable. */
+		realConfig?: boolean;
 	} = {},
 ): Promise<Built> {
 	const recorder: Recorder = {
@@ -153,6 +173,8 @@ async function build(
 		notices: [],
 		selectAnswer: options.selectAnswer,
 		selectCalls: 0,
+		confirmAnswer: options.confirmAnswer ?? false,
+		models: options.models ?? [],
 		entries: [],
 	};
 	const ctx = makeCtx(recorder, options.hasUI ?? true);
@@ -160,28 +182,30 @@ async function build(
 	const dbPath = path.join(agentDir, "smart-approve", `s-${nextSeq()}.sqlite`);
 	const paths: DiscoveryPaths = { cwd, agentDir, home };
 
+	const scriptedConfiguration =
+		options.resolveOverride ??
+		(() =>
+			resolveConfig(
+				[
+					{
+						scope: "user",
+						filePath: path.join(agentDir, "smart-approve.yml"),
+						rawContent: "{}",
+						data: {
+							judge: { authorizedModels: ["anthropic/scripted"] },
+							audit: { databasePath: dbPath },
+						},
+					},
+				],
+				[],
+				paths,
+			));
+
 	const factory = createSmartApproveExtension({
 		now: () => clock,
 		randomId: () => `audit-${nextSeq()}`,
 		randomNonce: () => `nonce-${nextSeq()}`,
-		resolveConfiguration:
-			options.resolveOverride ??
-			(() =>
-				resolveConfig(
-					[
-						{
-							scope: "user",
-							filePath: path.join(agentDir, "smart-approve.yml"),
-							rawContent: "{}",
-							data: {
-								judge: { authorizedModels: ["anthropic/scripted"] },
-								audit: { databasePath: dbPath },
-							},
-						},
-					],
-					[],
-					paths,
-				)),
+		...(options.realConfig === true ? {} : { resolveConfiguration: scriptedConfiguration }),
 		judge: async () => (options.judge ?? (() => ALLOW))(),
 		redactor: {
 			redactArguments: args => structuredClone(args),
@@ -197,6 +221,16 @@ async function build(
 		await fire(extension, "session_start", { type: "session_start" }, ctx);
 	}
 	return { extension, ctx, recorder, dbPath };
+}
+
+async function runCommand(built: Built, args: string): Promise<void> {
+	const command = built.extension.commands.get("smart-approve");
+	if (command === undefined) throw new Error("smart-approve command is not registered");
+	// `ExtensionCommandContext` adds session-tree operations (branch, newSession,
+	// navigateTree, …) that this command never calls; the scripted context covers
+	// every member it does touch.
+	const commandCtx = built.ctx as unknown as ExtensionCommandContext;
+	await command.handler(args, commandCtx);
 }
 
 async function fire(extension: Extension, event: string, payload: object, ctx: ExtensionContext): Promise<unknown> {
@@ -259,6 +293,90 @@ describe("registration", () => {
 	test("startup opens no dialog, so there is no automatic first-use wizard", async () => {
 		const built = await build();
 		expect(built.recorder.selectCalls).toBe(0);
+	});
+});
+
+/**
+ * `setup` ends by telling the operator to run `/smart-approve status`. If the
+ * write does not reach the running session, that instruction answers with a
+ * stale "not configured" and every scoped call keeps failing closed until the
+ * operator guesses that a restart is required.
+ */
+describe("configuration written mid-session", () => {
+	const SETUP_SESSION = {
+		realConfig: true,
+		models: [{ id: "claude-fast", provider: "anthropic" }],
+		selectAnswer: "anthropic/claude-fast",
+		confirmAnswer: true,
+	};
+
+	test("a successful setup arms the running session instead of waiting for a restart", async () => {
+		const built = await build({ ...SETUP_SESSION });
+		expect(built.recorder.statuses.get("smart-approve")).toContain("not configured");
+
+		await runCommand(built, "setup");
+
+		expect(readFileSync(path.join(agentDir, "smart-approve.yml"), "utf8")).toContain("anthropic/claude-fast");
+		expect(built.recorder.statuses.get("smart-approve")).toBeUndefined();
+
+		built.recorder.notices.length = 0;
+		await runCommand(built, "status");
+		const status = built.recorder.notices.join("\n");
+		expect(status).toContain("Gate: armed");
+		expect(status).toContain("authorized: anthropic/claude-fast");
+	});
+
+	test("setup adds the judge model without discarding the rest of the user's config", async () => {
+		const configPath = path.join(agentDir, "smart-approve.yml");
+		await Bun.write(
+			configPath,
+			["sensitivity:", "  fallback: strict", "judge:", "  maxOutputTokens: 2000", ""].join("\n"),
+		);
+
+		const built = await build({ ...SETUP_SESSION });
+		await runCommand(built, "setup");
+
+		// A wizard that silently deletes hand-written safety settings is worse than
+		// one that refuses to run: the operator keeps a config they no longer have.
+		const written = readFileSync(configPath, "utf8");
+		expect(written).toContain("anthropic/claude-fast");
+		expect(written).toContain("strict");
+		expect(written).toContain("2000");
+
+		built.recorder.notices.length = 0;
+		await runCommand(built, "status");
+		const status = built.recorder.notices.join("\n");
+		expect(status).toContain("Gate: armed");
+		expect(status).toContain("fallback:      strict");
+	});
+
+	test("a scoped call is judged as soon as setup writes, not blocked as unconfigured", async () => {
+		const built = await build({ ...SETUP_SESSION, judge: () => ALLOW });
+		const beforeSetup = await toolCall(built, "c1", "write", { path: "a.ts", content: "x" });
+		expect(beforeSetup?.block).toBe(true);
+		expect(beforeSetup?.reason).toContain("No authorized judge model configured");
+
+		await runCommand(built, "setup");
+
+		expect(await toolCall(built, "c2", "write", { path: "b.ts", content: "x" })).toBeUndefined();
+	});
+});
+
+/**
+ * OMP's interactive TUI folds consecutive "info" notifications into one mutable
+ * status line, so a per-line `notify` loop leaves only the last line visible —
+ * for `status` under default config, the trailing compatibility warning. The
+ * whole report must therefore reach the host as a single notification.
+ */
+describe("command output delivery", () => {
+	test("multi-line command output is a single notification, so the TUI status collapse cannot eat lines", async () => {
+		const built = await build();
+		built.recorder.notices.length = 0;
+		await runCommand(built, "status");
+		expect(built.recorder.notices).toHaveLength(1);
+		const only = built.recorder.notices[0] ?? "";
+		expect(only).toContain("SMART APPROVE STATUS");
+		expect(only.split("\n").length).toBeGreaterThan(10);
 	});
 });
 
@@ -451,6 +569,8 @@ describe("pending notice on startup", () => {
 			notices: [],
 			selectAnswer: undefined,
 			selectCalls: 0,
+			confirmAnswer: false,
+			models: [],
 			entries: [],
 		};
 		const ctx = makeCtx(recorder, true);
