@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { protectedTargets, ruleSpecificity } from "../src/config.ts";
+import { protectedTargets, resolveConfig, ruleSpecificity } from "../src/config.ts";
 import type { CallTarget, PolicyRule } from "../src/contracts.ts";
 import {
 	canonicalize,
@@ -229,6 +229,36 @@ describe("shell command extraction", () => {
 		const target = extractCommandTargets("$TOOL --flag").find(t => t.kind === "command");
 		expect(target?.dynamic).toBe(true);
 	});
+
+	test("an env assignment does not hide the program it launches", () => {
+		const commands = extractCommandTargets(`OMP_DISABLE_EXTENSIONS=1 omp -p "x"`)
+			.filter(t => t.kind === "command")
+			.map(t => t.requested);
+		expect(commands).toEqual(["OMP_DISABLE_EXTENSIONS=1", "omp"]);
+	});
+
+	test("an env wrapper hides neither the assignment nor the program", () => {
+		const commands = extractCommandTargets(`env OMP_DISABLE_EXTENSIONS=1 omp -p "x"`)
+			.filter(t => t.kind === "command")
+			.map(t => t.requested);
+		expect(commands).toEqual(["env", "OMP_DISABLE_EXTENSIONS=1", "omp"]);
+	});
+
+	test("a kill-switch flag is a command target so a deny rule can name it", () => {
+		// The program is legitimate; the flag is the bypass, so the flag has to be
+		// matchable on its own.
+		const commands = extractCommandTargets(`omp --no-extensions -p "x"`)
+			.filter(t => t.kind === "command")
+			.map(t => t.requested);
+		expect(commands).toEqual(["omp", "--no-extensions"]);
+	});
+
+	test("an ordinary invocation still yields exactly its executable", () => {
+		const commands = extractCommandTargets(`omp -p "x"`)
+			.filter(t => t.kind === "command")
+			.map(t => t.requested);
+		expect(commands).toEqual(["omp"]);
+	});
 });
 
 describe("scope classification", () => {
@@ -371,6 +401,40 @@ describe("rule matching", () => {
 		const target: CallTarget = { kind: "unknown", requested: "x", resolved: "x", dynamic: false };
 		expect(matchDeny(rules, "browser", "browser:open", [target])).toBeUndefined();
 		expect(matchDeny(rules, "browser", "browser:run", [target])?.rule.id).toBe("d");
+	});
+});
+
+describe("the builtin deny floor covers commands that remove this gate", () => {
+	// Resolved from zero config layers, so this exercises the shipped table
+	// exactly as an operator with no configuration file gets it.
+	const builtins = resolveConfig([], [], { cwd: CWD, agentDir: "/home/dev/.omp/agent", home: "/home/dev" }).rules;
+
+	const cases: Array<[string, string]> = [
+		[`omp --no-extensions -p "clean up"`, "builtin:nested-agent-no-extensions"],
+		[`omp -p "clean up" --dangerously-skip-permissions`, "builtin:nested-agent-skip-permissions"],
+		[`OMP_DISABLE_EXTENSIONS=1 omp -p "clean up"`, "builtin:disable-env-assignment-omp"],
+		[`env PI_DISABLE_PLUGINS=1 omp -p "clean up"`, "builtin:disable-env-assignment-pi"],
+	];
+
+	for (const [command, id] of cases) {
+		test(`${command} is denied by ${id}`, () => {
+			const hit = matchDeny(builtins, "bash", "bash", extractCommandTargets(command));
+			expect(hit?.rule.id).toBe(id);
+			expect(hit?.rule.risk).toBe("safety-tampering");
+			expect(hit?.rule.createdBy).toBe("builtin");
+		});
+	}
+
+	test("a nested agent that keeps the gate is not denied", () => {
+		// Denying `omp` itself would break delegation: the child still loads this
+		// plugin and still judges every call it makes.
+		const hit = matchDeny(builtins, "bash", "bash", extractCommandTargets(`omp -p "run the tests"`));
+		expect(hit).toBeUndefined();
+	});
+
+	test("an unrelated OMP_ environment variable is not denied", () => {
+		const targets = extractCommandTargets(`OMP_LOG_LEVEL=debug omp -p "run the tests"`);
+		expect(matchDeny(builtins, "bash", "bash", targets)).toBeUndefined();
 	});
 });
 
@@ -860,6 +924,53 @@ describe("exact allow binds to a location, not just an arguments hash", () => {
 		];
 		expect(matchExactAllow(rules, "bash", commandHash, targets, CWD)?.id).toBe("pin-bash");
 		expect(matchExactAllow(rules, "bash", commandHash, targets, "/other/project")).toBeUndefined();
+	});
+});
+
+describe("only an operator-written, absolutely bound allow-exact may skip the judge", () => {
+	const args = { path: "src/a.ts", content: "x" };
+	const hash = hashArguments(args);
+	const here = [resolvePathTarget("src/a.ts", CWD)];
+	const target = path.join(CWD, "src/a.ts");
+
+	function pinned(overrides: Partial<PolicyRule>) {
+		return [
+			rule({
+				id: "pin",
+				kind: "allow-exact",
+				toolName: "write",
+				target,
+				argumentsHash: hash,
+				cwd: CWD,
+				...overrides,
+			}),
+		];
+	}
+
+	test("a user-scope rule with an absolute cwd qualifies", () => {
+		expect(matchExactAllow(pinned({ createdBy: "user" }), "write", hash, here, CWD)?.id).toBe("pin");
+	});
+
+	test("a project-scope rule never qualifies, so a cloned repo cannot pre-authorize a call", () => {
+		expect(matchExactAllow(pinned({ createdBy: "project" }), "write", hash, here, CWD)).toBeUndefined();
+	});
+
+	for (const relative of [".", "./"]) {
+		test(`cwd "${relative}" never qualifies, because it resolves to wherever omp was launched`, () => {
+			// path.resolve(".") is the process cwd, so the binding would read as
+			// "here" and mean "anywhere".
+			expect(matchExactAllow(pinned({ cwd: relative }), "write", hash, here, process.cwd())).toBeUndefined();
+		});
+	}
+
+	test("each disqualifier explains itself rather than blaming a missing hash", () => {
+		const unpinned = [rule({ id: "pin", kind: "allow-exact", toolName: "write", target, cwd: CWD })];
+		const [noHash] = collectPostureHints(unpinned, "write", here);
+		const [fromProject] = collectPostureHints(pinned({ createdBy: "project" }), "write", here);
+		const [relativeCwd] = collectPostureHints(pinned({ cwd: "." }), "write", here);
+		expect(noHash).toContain("does not pin the exact call (no argumentsHash)");
+		expect(fromProject).toContain("comes from a project-scope configuration file");
+		expect(relativeCwd).toContain("is not bound to an absolute working directory");
 	});
 });
 

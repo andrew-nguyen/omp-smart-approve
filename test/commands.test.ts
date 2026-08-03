@@ -497,7 +497,7 @@ describe("rules", () => {
 		expect(out).toContain("skips the judge for this precise call in this directory");
 	});
 
-	test("posture degrades the moment any one of the three fields is missing", async () => {
+	test("posture degrades the moment any one condition is missing", async () => {
 		store.putRule(storedRule({ id: "no-hash", cwd: resolved.paths.cwd }));
 		store.putRule(storedRule({ id: "no-cwd", argumentsHash: "a".repeat(64) }));
 		store.putRule(
@@ -507,6 +507,39 @@ describe("rules", () => {
 		expect(out).toContain("advisory posture — still judged (no argumentsHash)");
 		expect(out).toContain("advisory posture — still judged (no cwd)");
 		expect(out).toContain("advisory posture — still judged (target is a pattern)");
+	});
+
+	test("a pinned rule from a project file reads as advisory, not as a bypass", async () => {
+		// A `smart-approve.yml` arriving with `git clone` is not an operator
+		// decision, so `matchExactAllow` refuses it — this label has to agree.
+		const configured = storedRule({
+			id: "cfg-pin",
+			createdBy: "project",
+			source: "/repo/.omp/smart-approve.yml",
+			argumentsHash: "a".repeat(64),
+			cwd: resolved.paths.cwd,
+		});
+		const out = await harness({ resolvedOverrides: { rules: [configured] } }).run("rules");
+		expect(out).toContain("advisory posture — still judged (project-scope file)");
+		expect(out).not.toContain("skips the judge for this precise call");
+	});
+
+	test("a pinned rule with a relative cwd reads as advisory, not as a bypass", async () => {
+		store.putRule(storedRule({ id: "rel-cwd", argumentsHash: "a".repeat(64), cwd: "." }));
+		const out = await harness().run("rules");
+		expect(out).toContain("advisory posture — still judged (cwd is not absolute)");
+		expect(out).not.toContain("skips the judge for this precise call");
+	});
+
+	test("show explains a relative cwd and a project scope rather than printing them bare", async () => {
+		store.putRule(storedRule({ id: "rel-cwd", argumentsHash: "a".repeat(64), cwd: "./sub" }));
+		expect(await harness().run("rules show rel-cwd")).toContain(
+			"cwd:         ./sub (relative — cannot skip the judge)",
+		);
+
+		const configured = storedRule({ id: "cfg-pin", createdBy: "project", source: "/repo/smart-approve.yml" });
+		const out = await harness({ resolvedOverrides: { rules: [configured] } }).run("rules show cfg-pin");
+		expect(out).toContain("created by:  project (project scope never skips the judge)");
 	});
 
 	test("show names the missing field so the operator can fix it", async () => {

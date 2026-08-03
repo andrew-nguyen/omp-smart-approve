@@ -203,10 +203,12 @@ Precedence, lowest to highest:
 4. Project: `<cwd>/smart-approve.yml`
 
 Sections merge key by key — a project layer that sets `sensitivity.fallback`
-does not discard your user-level `judge.authorizedModels`. `rules` arrays
-concatenate across layers, so a project layer can add deny rules but cannot
-delete a user deny rule. Tightening is always available downward; loosening is
-not.
+does not discard your user-level `judge.authorizedModels`. `rules` accumulate
+across layers on top of the built-in deny floor, and a **project** layer may
+only *add* IDs: a project file that redefines a rule ID from a broader layer is
+ignored with a compatibility warning naming the file and the ID. A **user**
+layer may redefine anything, including a builtin, because only a human writes
+that file. Tightening is always available downward; loosening is not.
 
 Config discovery looks in the working directory only, not its ancestors. A
 config file two directories up does not apply.
@@ -255,6 +257,27 @@ only matches one is decorative:
    normal shape of a create-then-overwrite attempt.
 3. A target too dynamic to resolve whose literal text still names a protected
    path (`~/...`, `$HOME/...`), matched by suffix.
+
+### Disabling the gate is protected too
+
+A file write is only one way to remove the gate. Launching a nested agent with
+its extension or approval layer switched off removes it from the child process
+without writing anything, so four rules ship in the built-in deny floor and
+apply with zero configuration:
+
+| Rule ID | Denies on `bash` |
+| --- | --- |
+| `builtin:nested-agent-no-extensions` | `--no-extensions` |
+| `builtin:nested-agent-skip-permissions` | `--dangerously-skip-permissions` |
+| `builtin:disable-env-assignment-omp` | `OMP_DISABLE_*=*` |
+| `builtin:disable-env-assignment-pi` | `PI_DISABLE_*=*` |
+
+`omp -p "…"` itself is **not** denied: the child still loads this plugin and
+still judges every call it makes, so denying it would break delegation without
+closing anything. Nor is `--approval-mode=yolo` — it widens what OMP
+auto-approves, and every one of those calls still reaches this gate.
+
+A user-scope file may redefine any of these by ID. A project file may not.
 
 ---
 
@@ -387,21 +410,29 @@ Targets are matched against both the literal string the agent wrote and its
 resolved absolute form, so prefer `**/thing/**` over `thing/**` — the latter
 misses absolute paths.
 
-**Deny rules on shell calls can only name the executable.** Smart Approve
-extracts the leading command of each `;`/`&&`/`||`/`|` segment plus any literal
-URL operand; it deliberately does not parse flags, because a rule that believes
-it understands shell quoting is a rule with a bypass in it. `target: terraform`
-works. `target: "re:^terraform apply"` matches nothing. Argument-level
-semantics — `--force`, `--context prod`, a computed path — are exactly what the
-judge is for.
+**Deny rules on shell calls name command-position tokens, not arguments.** Smart
+Approve extracts, per `;`/`&&`/`||`/`|` segment: a leading `env` wrapper, each
+leading `NAME=VALUE` assignment, the executable that follows them, and any
+literal URL operand. It deliberately does not parse the rest of the flags,
+because a rule that believes it understands shell quoting is a rule with a
+bypass in it. `target: terraform` works. `target: "re:^terraform apply"` matches
+nothing. Argument-level semantics — `--force`, `--context prod`, a computed
+path — are exactly what the judge is for.
+
+The one exception is the kill-switch flag set backing the built-in deny floor
+(`--no-extensions`, `--dangerously-skip-permissions`): those are emitted as
+command targets wherever they appear in a segment, because there the flag *is*
+the action.
 
 ### Only a fully specified allow may skip the judge
 
-An `allow-exact` rule skips judgment **only** when all three of these hold:
+An `allow-exact` rule skips judgment **only** when all four of these hold:
 
 1. `argumentsHash` pins the exact literal call,
-2. `target` equals a **resolved, non-dynamic** target of that call, and
-3. `cwd` resolves to the working directory the call runs in.
+2. `target` equals a **resolved, non-dynamic** target of that call,
+3. `cwd` is an **absolute** path equal to the working directory the call runs
+   in, and
+4. the rule comes from the **user-scope** file, `<agentDir>/smart-approve.yml`.
 
 **Omit any one and the rule degrades to advisory posture** — matching calls are
 still judged in full. There is no partial credit.
@@ -429,6 +460,18 @@ every checkout on the machine, so a user-scoped pinned rule without `cwd` would
 fire in all of them. `cwd` is the repository and working-directory identity a
 persisted allow is supposed to carry.
 
+**Why `cwd` must be absolute.** `path.resolve(".")` is whatever directory OMP
+was launched from, so `cwd: .` and `cwd: ./` read as "here" and mean "anywhere":
+they match in every checkout on the machine. A relative `cwd` therefore demotes
+the rule to advisory, and the demotion is reported as a compatibility warning at
+load.
+
+**Why user scope.** A pinned allow is the only rule that runs a call with no
+judge and no human prompt. A `smart-approve.yml` arriving with `git clone` is
+not an operator decision, so a project-scope `allow-exact` is always advisory —
+also warned about at load, and also never rejected: the call is judged, not
+failed.
+
 **Why the resolved target as well.** It pins *what* the call points at, where
 `cwd` pins *where* it runs. A target the plugin could not resolve — a glob, a
 shell substitution, an unexpanded variable — is dynamic and can never match; a
@@ -440,10 +483,11 @@ people up:
 - **Path tools** (`write`, `edit`, `read`): the resolved target is always the
   **absolute** path, so a relative `target:` can never match. Write the absolute
   path.
-- **Command tools** (`bash`): the resolved target is the leading **executable,
-  exactly as typed** — relative or absolute, whichever you wrote. `target: bun`
-  therefore matches `bun ...` anywhere, which is exactly why `cwd` is required
-  rather than optional.
+- **Command tools** (`bash`): the resolved targets are the **command-position
+  tokens, exactly as typed** — the executable, plus a leading `env` wrapper or
+  `NAME=VALUE` assignment if present, relative or absolute, whichever you wrote.
+  `target: bun` therefore matches `bun ...` anywhere, which is exactly why `cwd`
+  is required rather than optional.
 
 ### Any wildcard in an allow makes it a hint
 
@@ -902,19 +946,23 @@ fast path viable for longer, raise `timeouts.brokerArgsTtlMs` — and keep it at
 below `pendingApprovalTtlMs`.
 
 **My pinned `allow-exact` rule is still being judged.**
-All three fields must hold, so check each one. `argumentsHash` must be the hash
-of *this* call — any change to the arguments produces a different hash. `cwd`
-must be the absolute working directory the call runs in. And `target` must be
-spelled the way the call resolves it: an absolute path for `write`/`edit`/
-`read`, the leading executable exactly as typed for `bash`. A relative target
-never matches a path tool, and a dynamic target (glob, shell substitution,
-unexpanded variable) never matches anything. `/smart-approve review <audit-id>`
-shows the hash, the resolved target, and the working directory for a real call.
+All four conditions must hold, so check each one. `argumentsHash` must be the
+hash of *this* call — any change to the arguments produces a different hash.
+`cwd` must be the **absolute** working directory the call runs in; `.` or a
+relative path never qualifies. The rule must live in the user-scope file,
+`<agentDir>/smart-approve.yml` — a pinned allow in a project file is advisory by
+design. And `target` must be spelled the way the call resolves it: an absolute
+path for `write`/`edit`/`read`, a command-position token exactly as typed for
+`bash`. A relative target never matches a path tool, and a dynamic target (glob,
+shell substitution, unexpanded variable) never matches anything.
+`/smart-approve review <audit-id>` shows the hash, the resolved target, and the
+working directory for a real call.
 
-A rule missing any one of the three is not broken — it is working as specified,
-as advisory posture. `/smart-approve rules list` says which it is: an incomplete
-pin reads `advisory posture — still judged` and names the missing field, and
-`rules show <id>` prints `argsHash:` and `cwd:` outright.
+A rule missing any one of the four is not broken — it is working as specified,
+as advisory posture. `/smart-approve status` lists the scope and relative-`cwd`
+demotions under "Compatibility warnings"; `/smart-approve rules list` says which
+a rule is: an incomplete pin reads `advisory posture — still judged` and names
+the missing field, and `rules show <id>` prints `argsHash:` and `cwd:` outright.
 
 **A pinned rule stopped working after I moved the repository.**
 Expected. `cwd` binds an exact allow to one working directory by design, so

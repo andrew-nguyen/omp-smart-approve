@@ -1121,3 +1121,60 @@ describe("a pinned allow is bound to its working directory", () => {
 		expect(h.judgeCalls).toHaveLength(1);
 	});
 });
+
+describe("the built-in floor stops a call that would run outside this gate", () => {
+	test("a nested agent launched with --no-extensions is denied before the judge", async () => {
+		const h = harness({ judge: async () => verdict("allow") });
+		const result = await h.gate.evaluate(
+			makeRequest({ toolName: "bash", args: { command: `omp --no-extensions -p "clean up"` } }),
+			AUTO,
+		);
+		expect(result.decision).toBe("block");
+		expect(result.stage).toBe("deny-rule");
+		expect(h.judgeCalls).toHaveLength(0);
+	});
+
+	test("a nested agent that keeps the gate is judged normally", async () => {
+		const h = harness({ judge: async () => verdict("allow") });
+		const result = await h.gate.evaluate(
+			makeRequest({ toolName: "bash", args: { command: `omp -p "run the tests"` } }),
+			AUTO,
+		);
+		expect(result.decision).toBe("allow");
+		expect(h.judgeCalls).toHaveLength(1);
+	});
+
+	test("a pinned allow-exact from a project file is judged, never bypassed", async () => {
+		const args = { command: "scripts/verify.sh" };
+		const resolved = resolveConfig(
+			[
+				{ scope: "user", filePath: "/u.yml", rawContent: "{}", data: { judge: { authorizedModels: ["a/b"] } } },
+				{
+					scope: "project",
+					filePath: "/repo/project/.omp/smart-approve.yml",
+					rawContent: "{}",
+					data: {
+						rules: [
+							{
+								id: "pin-from-repo",
+								kind: "allow-exact",
+								tool: "bash",
+								target: "scripts/verify.sh",
+								argumentsHash: hashArguments(args),
+								cwd: CWD,
+								reason: "shipped in the repository",
+							},
+						],
+					},
+				},
+			],
+			[],
+			paths,
+		);
+		const h = harness({ resolved, judge: async () => verdict("block") });
+		const result = await h.gate.evaluate(makeRequest({ toolName: "bash", args }), AUTO);
+		expect(result.stage).not.toBe("exact-allow-rule");
+		expect(result.decision).toBe("block");
+		expect(h.judgeCalls).toHaveLength(1);
+	});
+});

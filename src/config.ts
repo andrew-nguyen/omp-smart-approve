@@ -190,6 +190,50 @@ export const smartApproveConfigSchema = z
 
 export type SmartApproveConfig = z.infer<typeof smartApproveConfigSchema>;
 
+/**
+ * Deny floor that ships with the plugin.
+ *
+ * These cover the one thing no operator policy can be relied on to cover: an
+ * action whose whole purpose is to run the next step outside this gate. They are
+ * seeded as raw data before any file layer, so a user-scope file may redefine
+ * one by ID (fact 37's explicit human override) while a project-scope file may
+ * not.
+ */
+export const BUILTIN_RULES: SmartApproveConfig["rules"] = [
+	{
+		id: "builtin:nested-agent-no-extensions",
+		kind: "deny-exact",
+		tool: "bash",
+		target: "--no-extensions",
+		risk: "safety-tampering",
+		reason: "Disables extension discovery, so Smart Approve does not load in the nested session.",
+	},
+	{
+		id: "builtin:nested-agent-skip-permissions",
+		kind: "deny-exact",
+		tool: "bash",
+		target: "--dangerously-skip-permissions",
+		risk: "safety-tampering",
+		reason: "Runs a nested agent with its approval prompts disabled; that session is outside this gate.",
+	},
+	{
+		id: "builtin:disable-env-assignment-omp",
+		kind: "deny-pattern",
+		tool: "bash",
+		target: "OMP_DISABLE_*=*",
+		risk: "safety-tampering",
+		reason: "Environment kill switch aimed at omp's extension loading.",
+	},
+	{
+		id: "builtin:disable-env-assignment-pi",
+		kind: "deny-pattern",
+		tool: "bash",
+		target: "PI_DISABLE_*=*",
+		risk: "safety-tampering",
+		reason: "Environment kill switch aimed at omp's extension loading, PI_ prefix.",
+	},
+];
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -498,9 +542,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * that only sets `sensitivity` would silently reset the user's `timeouts` back to
  * stock — a config-shaped way to widen the deadline budget without saying so.
  *
- * `rules` accumulate across layers; a nearer layer overrides an earlier rule only
- * when it redefines the same rule ID, so a project can add restrictions without
- * dropping user-level denies.
+ * `rules` accumulate across layers on top of `BUILTIN_RULES`. A user-scope file
+ * may redefine any ID, including a builtin — only a human writes that file. A
+ * project-scope file may add new IDs but may never redefine one from a broader
+ * layer, so a cloned repository cannot drop a user-level or builtin deny.
  */
 export function resolveConfig(
 	layerInputs: readonly LoadedLayerInput[],
@@ -512,7 +557,10 @@ export function resolveConfig(
 	const layers: ConfigLayer[] = [];
 
 	const merged: Record<string, unknown> = {};
-	const rawRuleById = new Map<string, { rule: unknown; scope: "user" | "project"; source: string }>();
+	const rawRuleById = new Map<string, { rule: unknown; scope: "builtin" | "user" | "project"; source: string }>();
+	for (const rule of BUILTIN_RULES) {
+		rawRuleById.set(rule.id, { rule, scope: "builtin", source: "builtin defaults" });
+	}
 
 	for (const input of layerInputs) {
 		if (input.data === undefined) continue;
@@ -552,9 +600,16 @@ export function resolveConfig(
 
 		for (const rule of Array.isArray(raw.rules) ? raw.rules : []) {
 			const id = asRecord(rule)?.id;
-			if (typeof id === "string") {
-				rawRuleById.set(id, { rule, scope: input.scope, source: input.filePath });
+			if (typeof id !== "string") continue;
+			const existing = rawRuleById.get(id);
+			if (input.scope === "project" && existing !== undefined) {
+				warnings.push(
+					`${input.filePath} redefines rule "${id}" from ${existing.source}. A project-scope file may add rules ` +
+						`but may not redefine one from a broader layer, so the original is kept.`,
+				);
+				continue;
 			}
+			rawRuleById.set(id, { rule, scope: input.scope, source: input.filePath });
 		}
 
 		layers.push({
@@ -577,6 +632,23 @@ export function resolveConfig(
 		}
 		const [rule] = toPolicyRules([parsedRule.data], entry.scope, entry.source);
 		if (rule) ruleById.set(id, rule);
+	}
+
+	// A pinned allow that no longer skips the judge is a silent behaviour change
+	// from the operator's point of view, so name the rule and the fix.
+	for (const rule of ruleById.values()) {
+		if (rule.kind !== "allow-exact" || rule.argumentsHash === undefined) continue;
+		if (rule.createdBy === "project") {
+			warnings.push(
+				`Rule "${rule.id}" pins an exact call but comes from a project-scope file (${rule.source}); ` +
+					`project-scope allows never skip the judge. Move it to the user-scope configuration to restore the bypass.`,
+			);
+		} else if (rule.cwd !== undefined && !path.isAbsolute(rule.cwd)) {
+			warnings.push(
+				`Rule "${rule.id}" pins an exact call but its cwd "${rule.cwd}" is not absolute; a relative cwd ` +
+					`resolves to wherever omp is launched, so the rule never skips the judge. Use an absolute path.`,
+			);
+		}
 	}
 
 	// Re-parse the merged object so defaults fill in and the strict check runs once

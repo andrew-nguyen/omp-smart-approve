@@ -56,16 +56,16 @@ bun install --frozen-lockfile && bun run check && bun test && bun run smoke && b
 | 30 | Persistent exact allow after a second confirmation, bound to the approving directory plus policy hash, listable and revocable | `test/commands.test.ts` "a persistent grant needs a second explicit confirmation", "`survives restarts` is true: a persistent grant outlives the database handle", "each scope's printed lifetime is the lifetime the grant receives", rule listing and revocation; `test/store.test.ts` "grants are bound to the working directory they were approved from". **The fact's project-scope default, repository identity, and user-wide opt-in are not implemented** — see deviation 5 |
 | 31 | Session bypass needs typed confirmation, is session-only, persistently warned, and audited; the model cannot set it | `test/commands.test.ts` bypass challenge/cancel/re-enable, "`no environment variable disables it` is true of every env read in src"; `test/gate.test.ts` "session bypass" (including "a bypass does not stop the pre-screen on a call OMP prompts about"); `test/package.test.ts` "no silent kill switch" |
 | 32 | Ordered resolution: deny first, narrow exact allow may skip, broad allow only informs posture, rest are judged | `test/policy.test.ts` "deterministic precedence", "exact allow rules: only a fully specified call may skip the judge", "exact allow binds to a location"; `test/gate.test.ts` "exact allow rule end to end" |
-| 33 | Only a fully specified canonical allow may skip; one wildcard makes it posture | `test/policy.test.ts` "wildcard allows never bypass the judge", "a wildcard target disqualifies even with a matching hash" |
+| 33 | Only a fully specified canonical allow may skip; one wildcard makes it posture | `test/policy.test.ts` "wildcard allows never bypass the judge", "a wildcard target disqualifies even with a matching hash", "only an operator-written, absolutely bound allow-exact may skip the judge"; `test/gate.test.ts` "a pinned allow-exact from a project file is judged, never bypassed"; `test/commands.test.ts` "a pinned rule from a project file reads as advisory, not as a bypass", "a pinned rule with a relative cwd reads as advisory, not as a bypass" (`rulePosture` is the operator-facing half of the same predicate). Enforced **narrower** than the fact: a fully specified allow additionally may not come from a project-scope file and must name an absolute `cwd`, because a `smart-approve.yml` arriving with `git clone` is not an operator decision and `path.resolve(".")` is whatever directory omp was launched from. A disqualified rule is demoted to advisory posture and warned about at load, never rejected |
 | 34 | `SMART_APPROVE.md` discovered broadest to most specific and presented as authoritative policy | `test/config.test.ts` "discovery order"; `test/judge.test.ts` policy documents labelled AUTHORITATIVE |
 | 35 | Layered sensitivity; narrowest wins; risk-specific stays strict for a permissive tool; never overrides a deny | `test/config.test.ts` "sensitivity precedence"; `test/gate.test.ts` "per-risk sensitivity tightens once a risk class exists" (including the one-directional property) |
 | 36 | Judge suggestions are constrained, non-binding, previewed, and applied only after confirmation | `test/judge.test.ts` wildcard allow-exact suggestion rejected; `test/commands.test.ts` `apply-suggestion` validation and wildcard downgrade, "an exact suggested allow reads advisory and cannot skip the judge" |
-| 37 | Plugin config, policy files, and other active OMP safety-policy files are write-protected by default | `test/config.test.ts` "protected surfaces"; `test/policy.test.ts` "protected policy floor", "the protected floor follows symlinks"; `test/gate.test.ts` "a protected policy write blocks with no judge call" |
+| 37 | Plugin config, policy files, and other active OMP safety-policy files are write-protected by default | `test/config.test.ts` "protected surfaces", "the builtin deny floor"; `test/policy.test.ts` "protected policy floor", "the protected floor follows symlinks", "the builtin deny floor covers commands that remove this gate"; `test/gate.test.ts` "a protected policy write blocks with no judge call", "the built-in floor stops a call that would run outside this gate". The floor also covers *disabling* the gate without writing anything: `src/config.ts` `BUILTIN_RULES` denies `--no-extensions`, `--dangerously-skip-permissions`, and `OMP_DISABLE_*=*`/`PI_DISABLE_*=*` assignments on `bash`. Per the fact's "unless the human explicitly overrides them", a user-scope file may redefine a builtin by ID; a project-scope file may not, and the attempt is warned about |
 | 38 | Configuration exposes providers, sensitivity, scope, size thresholds, timeouts, escalation, rules, audit | `test/config.test.ts` (schema strictness across every section) |
 | 39 | Commands for status, setup, rules, review, override, and bypass | `test/commands.test.ts` (all nine subcommands); `test/omp-contract.test.ts` "registers exactly one namespaced command" |
 | 40 | Compact redacted audit metadata; no raw arguments, messages, or secrets duplicated | `test/audit-redaction.test.ts` (including a raw-file byte scan of the database and WAL, with a positive control); `test/gate.test.ts` "no raw argument value reaches the audit row"; `scripts/smoke.ts` redaction sweep. **The guard is runtime, not type-level** — see the note below. |
-| 41 | Deterministic tests across scoping, precedence, model selection, isolation, redaction, oversized args, verdicts, fail-closed paths, UI defaults, brokering, nonce/TTL, loop breaking, overrides, bypass, audit redaction | The whole `test/` suite — 848 tests across 20 files |
-| 42 | Opt-in live evaluation over a versioned adversarial/benign corpus with a machine-readable report | `test/eval-schema.test.ts`; `eval/cases.jsonl` (40 cases, 13 categories); `bun run eval:live -- --help` |
+| 41 | Deterministic tests across scoping, precedence, model selection, isolation, redaction, oversized args, verdicts, fail-closed paths, UI defaults, brokering, nonce/TTL, loop breaking, overrides, bypass, audit redaction | The whole `test/` suite — 878 tests across 20 files |
+| 42 | Opt-in live evaluation over a versioned adversarial/benign corpus with a machine-readable report | `test/eval-schema.test.ts`; `eval/cases.jsonl` (41 cases, 13 categories); `bun run eval:live -- --help` |
 | 43 | Ordinary CI needs no credentials; live evaluation is opt-in | `test/package.test.ts` "ordinary CI scripts never reference a provider credential"; the release sequence runs green with every provider key unset |
 | 44 | Docs, example deterministic and natural-language policies, and a local smoke check | `README.md`, `examples/smart-approve.yml`, `examples/SMART_APPROVE.md`, `scripts/smoke.ts` (12 scenarios) |
 
@@ -157,23 +157,35 @@ only a tool and target leaves every other argument unspecified — a `write` rul
 naming a path would authorize arbitrary content at that path, which fact-33
 explicitly forbids ("or omitted argument").
 
-An `allow-exact` rule now skips the judge only when all three hold:
+An `allow-exact` rule now skips the judge only when all four hold:
 
 - `argumentsHash` pins the literal call;
 - `target` equals a resolved, non-dynamic target of that call;
-- `cwd` resolves to the call's working directory.
+- `cwd` is an absolute path equal to the call's working directory;
+- the rule was loaded from the user-scope configuration file.
 
-The last two exist because the arguments hash is location-blind:
+The middle two exist because the arguments hash is location-blind:
 `write {path: "src/a.ts"}` and `bash {command: "scripts/x.sh"}` both hash
 identically in every checkout, so a user-scoped rule without them would fire
 everywhere. The `cwd` binding is what delivers fact-30's working-directory
 identity; there is no repository identity, by choice — see deviation 5. The
-target check alone is not enough for command tools, whose resolved target is the
-executable exactly as typed. An
-`allow-exact` rule missing any of the three degrades to an advisory posture hint.
+target check alone is not enough for command tools, whose resolved targets are
+the command-position tokens exactly as typed. The absolute-path requirement
+exists because `path.resolve(".")` is whatever directory omp was launched from,
+so `cwd: .` reads as "here" and means "anywhere". The scope requirement exists
+because a configuration file arriving with `git clone` is not an operator
+decision, and a pinned allow is the only rule that runs a call with no judge and
+no human prompt. An `allow-exact` rule missing any of the four degrades to an
+advisory posture hint, and the two newer demotions are surfaced as load-time
+compatibility warnings naming the rule.
+
 Evidence: `test/policy.test.ts` "exact allow binds to a location, not just an
-arguments hash"; `test/gate.test.ts` "a pinned allow is bound to its working
-directory".
+arguments hash" and "only an operator-written, absolutely bound allow-exact may
+skip the judge"; `test/gate.test.ts` "a pinned allow is bound to its working
+directory" and "a pinned allow-exact from a project file is judged, never
+bypassed"; `test/config.test.ts` "the builtin deny floor" (both load-time
+warnings); `test/commands.test.ts` "a pinned rule with a relative cwd reads as
+advisory, not as a bypass".
 
 ### 3. Grants and audit rows needed working-directory identity
 

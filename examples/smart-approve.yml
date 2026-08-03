@@ -175,13 +175,21 @@ ui:
 # form, so prefer `**/x/**` over `x/**` — the latter misses absolute paths.
 # `tool: "*"` matches every tool.
 #
-# IMPORTANT — deny rules on shell calls can only name the EXECUTABLE. Smart
-# Approve extracts the leading command of each `;`/`&&`/`||`/`|` segment plus
-# any literal URL operand; it deliberately does not parse flags, because a rule
-# that thinks it understands shell quoting is a rule with a bypass in it. So
-# `target: terraform` works and `target: "re:^terraform apply"` matches nothing.
-# Argument-level semantics — `--force`, `--context prod`, a computed path — are
-# exactly what the judge is for.
+# IMPORTANT — deny rules on shell calls name COMMAND-POSITION tokens, not
+# arguments. Per `;`/`&&`/`||`/`|` segment, Smart Approve extracts a leading
+# `env` wrapper, each leading `NAME=VALUE` assignment, the executable that
+# follows them, and any literal URL operand. It deliberately does not parse the
+# remaining flags, because a rule that thinks it understands shell quoting is a
+# rule with a bypass in it. So `target: terraform` works and
+# `target: "re:^terraform apply"` matches nothing. Argument-level semantics —
+# `--force`, `--context prod`, a computed path — are exactly what the judge is
+# for.
+#
+# The one exception is the kill-switch flag set behind the shipped deny floor
+# below (`--no-extensions`, `--dangerously-skip-permissions`): those are emitted
+# as command targets wherever they appear in a segment, because there the flag
+# IS the action rather than an argument to it. You cannot add to that set from
+# configuration.
 #
 # On allow rules, read the note above `allow-verify-ledger` before adding one.
 rules:
@@ -256,6 +264,44 @@ rules:
     risk: safety-tampering
     reason: Workflow files gate merges; changing them from an agent session removes the check that would catch it.
 
+  # -- Deny: removing the approval layer itself (SHIPPED DEFAULTS) ---------
+  # These four rules are built into the plugin and are always active — you do
+  # not need to copy them. They are reproduced here, commented out, so the
+  # floor is visible and so you can see the exact IDs.
+  #
+  # A USER-scope file (`<agentDir>/smart-approve.yml`) may redefine any of them
+  # by ID; only a human writes that file. A PROJECT-scope file may not — a
+  # redefinition there is ignored with a warning, so a cloned repository cannot
+  # lower the floor.
+  #
+  # - id: builtin:nested-agent-no-extensions
+  #   kind: deny-exact
+  #   tool: bash
+  #   target: "--no-extensions"
+  #   risk: safety-tampering
+  #   reason: Disables extension discovery, so Smart Approve does not load in the nested session.
+  #
+  # - id: builtin:nested-agent-skip-permissions
+  #   kind: deny-exact
+  #   tool: bash
+  #   target: "--dangerously-skip-permissions"
+  #   risk: safety-tampering
+  #   reason: Runs a nested agent with its approval prompts disabled; that session is outside this gate.
+  #
+  # - id: builtin:disable-env-assignment-omp
+  #   kind: deny-pattern
+  #   tool: bash
+  #   target: "OMP_DISABLE_*=*"
+  #   risk: safety-tampering
+  #   reason: Environment kill switch aimed at omp's extension loading.
+  #
+  # - id: builtin:disable-env-assignment-pi
+  #   kind: deny-pattern
+  #   tool: bash
+  #   target: "PI_DISABLE_*=*"
+  #   risk: safety-tampering
+  #   reason: Environment kill switch aimed at omp's extension loading, PI_ prefix.
+
   # -- Posture: tighten judgment without blocking --------------------------
   # A posture rule never allows or blocks. It raises the judge's strictness for
   # calls that match, which is the right tool when "usually fine, occasionally
@@ -280,7 +326,7 @@ rules:
     reason: Scratch output under .tmp is routine; treat it as low-friction but still judge it.
 
   # -- Allow-exact: the only rule shape that can skip the judge -------------
-  # It skips judgment only when ALL THREE of these hold. Omit any one and the
+  # It skips judgment only when ALL FOUR of these hold. Omit any one and the
   # rule degrades to advisory posture: the call is still judged in full.
   #
   #   1. `argumentsHash` pins the exact literal call. Copy it from an audit row
@@ -290,25 +336,35 @@ rules:
   #
   #   2. `target` equals a RESOLVED, non-dynamic target of the call.
   #
-  #   3. `cwd` is the absolute working directory the call runs in. This is what
-  #      actually binds the rule to one location. The arguments hash is
-  #      location-blind — `bash {command: "scripts/verify-ledger.sh"}` hashes
-  #      identically in every checkout on the machine — so without `cwd` a
-  #      user-scoped rule would fire in all of them.
+  #   3. `cwd` is an ABSOLUTE working directory. This is what actually binds the
+  #      rule to one location. The arguments hash is location-blind — `bash
+  #      {command: "scripts/verify-ledger.sh"}` hashes identically in every
+  #      checkout on the machine — so without `cwd` a user-scoped rule would
+  #      fire in all of them. A relative `cwd` (`.`, `./`, `../repo`) resolves
+  #      to wherever OMP was launched, so it reads as "here" and means
+  #      "anywhere"; it is rejected and the rule is demoted to advisory.
+  #
+  #   4. The rule lives in the USER-scope file (`<agentDir>/smart-approve.yml`).
+  #      A pinned allow in a project file would let a cloned repository
+  #      pre-authorize one call with no judge and no human prompt, so a
+  #      project-scope allow-exact is always advisory. Both demotions are
+  #      reported at load as a compatibility warning naming the rule.
   #
   # `/smart-approve review <audit-id>` prints the hash, the resolved target, and
   # the working directory for a real call, so all three come from one place.
   # After adding the rule, `/smart-approve rules list` tells you whether it
   # actually qualifies: an incomplete pin reads "advisory posture — still judged"
-  # and names the missing field.
+  # and names the condition it fails.
   #
   # How `target` resolves, per tool family — this trips people up:
   #
   #   - Path tools (write/edit/read): the resolved target is ALWAYS the absolute
   #     path, so a relative `target:` can never match. Write the absolute path.
-  #   - Command tools (bash): the resolved target is the leading executable
-  #     EXACTLY as typed, relative or absolute. `target: bun` matches `bun ...`
-  #     anywhere, which is precisely why `cwd` is required rather than optional.
+  #   - Command tools (bash): the resolved targets are the command-position
+  #     tokens EXACTLY as typed — the executable, plus a leading `env` wrapper
+  #     or `NAME=VALUE` assignment if present, relative or absolute. So
+  #     `target: bun` matches `bun ...` anywhere, which is precisely why `cwd`
+  #     is required rather than optional.
   #   - A target the plugin could not resolve — a glob, a shell substitution, an
   #     unexpanded variable — is dynamic and can never match. Deliberate: a call
   #     whose destination we only guessed at must not reach an allow.

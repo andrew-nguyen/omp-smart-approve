@@ -96,6 +96,16 @@ export function hashCanonicalCall(call: CanonicalCall): string {
 const PATTERN_OPERATORS = /[*?[\]{}()|]/;
 const SHELL_DYNAMIC = /[$`]|\$\{|\$\(/;
 const URL_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+/** Leading `NAME=VALUE` shell assignment. */
+const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * Flags that remove an agent's approval layer from a nested invocation.
+ * `--no-extensions` is omp's own, verified in `omp --help`. The Claude Code
+ * spelling is included because a nested non-omp agent is outside this gate
+ * entirely — unverified against that CLI's current syntax, and harmless if it
+ * no longer exists.
+ */
+const KILL_SWITCH_FLAGS = new Set(["--no-extensions", "--dangerously-skip-permissions"]);
 
 /**
  * Internal URI schemes OMP resolves purely locally.
@@ -177,7 +187,11 @@ export function resolveUrlTarget(requested: string): CallTarget {
 }
 
 /**
- * Leading executable of each `;`/`&&`/`||`/`|` segment, plus literal URL operands.
+ * Command-position tokens of each `;`/`&&`/`||`/`|` segment, plus literal URL
+ * operands. Command position means a leading `env` wrapper, each leading
+ * `NAME=VALUE` assignment, and the executable that follows them; any
+ * approval-layer kill-switch flag anywhere in the segment is emitted too, so a
+ * deny rule can match the bypass rather than only the program being bypassed.
  *
  * Splitting happens BEFORE tokenizing, so a separator inside quotes still yields
  * the following word as a candidate command. That over-extracts — `git commit -m
@@ -191,17 +205,33 @@ export function extractCommandTargets(command: string): CallTarget[] {
 	for (const rawSegment of command.split(/(?:\|\||&&|[;|&\n])/)) {
 		const segment = rawSegment.trim();
 		if (segment.length === 0) continue;
-		const tokens = segment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
-		const first = tokens[0]?.replace(/^["']|["']$/g, "");
-		if (!first) continue;
-		targets.push({
-			kind: "command",
-			requested: first,
-			...(SHELL_DYNAMIC.test(first) ? { dynamic: true } : { resolved: first, dynamic: false }),
-		});
-		for (const token of tokens.slice(1)) {
-			const operand = token.replace(/^["']|["']$/g, "");
-			if (operand.startsWith("-") || operand.length === 0) continue;
+		const words = (segment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map(t => t.replace(/^["']|["']$/g, ""));
+		if (words.length === 0) continue;
+		const commandTokens: string[] = [];
+		let i = 0;
+		if (words[0] === "env") {
+			commandTokens.push("env");
+			i = 1;
+			while (words[i]?.startsWith("-") === true) i++;
+		}
+		for (let w = words[i]; w !== undefined && ENV_ASSIGNMENT.test(w); w = words[i]) {
+			commandTokens.push(w);
+			i++;
+		}
+		const executable = words[i];
+		if (executable !== undefined && executable.length > 0) commandTokens.push(executable);
+		for (const word of words) if (KILL_SWITCH_FLAGS.has(word)) commandTokens.push(word);
+		if (commandTokens.length === 0) continue;
+		for (const token of commandTokens) {
+			targets.push({
+				kind: "command",
+				requested: token,
+				...(SHELL_DYNAMIC.test(token) ? { dynamic: true } : { resolved: token, dynamic: false }),
+			});
+		}
+		for (let w = 1; w < words.length; w++) {
+			const operand = words[w];
+			if (operand === undefined || operand.length === 0 || operand.startsWith("-")) continue;
 			if (URL_SCHEME.test(operand)) {
 				targets.push(resolveUrlTarget(operand));
 			}
@@ -569,6 +599,11 @@ export function matchDeny(
  *   arguments hash alone is cwd-blind: `write {path: "src/a.ts"}` hashes
  *   identically in every repository, so a user-scoped pinned rule would fire
  *   everywhere. Matching the resolved absolute path binds it to one location.
+ * - The rule must not come from a project-scope file. A `smart-approve.yml`
+ *   arriving with `git clone` is not an operator decision, and a bypass is the
+ *   one rule kind that runs with no judge and no human prompt.
+ * - `cwd` must be absolute. `path.resolve(".")` is the process working
+ *   directory, so a relative binding reads as "here" and means "anywhere".
  *
  * Anything less is posture, surfaced by {@link collectPostureHints}.
  */
@@ -587,6 +622,9 @@ export function matchExactAllow(
 		if (rule.toolName !== toolName) continue;
 		if (!isExactTarget(rule.target)) continue;
 		if (rule.argumentsHash === undefined) continue;
+		// Provenance and location must both be operator-chosen, not repository-supplied.
+		if (rule.createdBy === "project") continue;
+		if (rule.cwd === undefined || !path.isAbsolute(rule.cwd)) continue;
 		if (rule.argumentsHash !== argumentsHash) continue;
 		// Location identity. Without it the same hash authorizes the call in every
 		// checkout — `bash {command: "scripts/x.sh"}` hashes identically everywhere,
@@ -625,11 +663,28 @@ export function collectPostureHints(
 			hints.push(`posture ${rule.id}: sensitivity ${rule.sensitivity ?? "unchanged"} — ${rule.reason}`);
 		} else if (rule.kind === "allow-pattern") {
 			hints.push(`allow-pattern ${rule.id} matches, but a patterned allow never skips judgment — ${rule.reason}`);
-		} else {
-			// An allow-exact that reached here failed to qualify as a bypass.
+		} else if (rule.argumentsHash === undefined) {
 			hints.push(
 				`allow-exact ${rule.id} matches this target but does not pin the exact call ` +
 					`(no argumentsHash), so it is advisory only — ${rule.reason}`,
+			);
+		} else if (rule.createdBy === "project") {
+			hints.push(
+				`allow-exact ${rule.id} matches this target but comes from a project-scope configuration file, ` +
+					`which may not skip the judge, so it is advisory only — ${rule.reason}`,
+			);
+		} else if (rule.cwd === undefined || !path.isAbsolute(rule.cwd)) {
+			hints.push(
+				`allow-exact ${rule.id} matches this target but is not bound to an absolute working directory, ` +
+					`so it is advisory only — ${rule.reason}`,
+			);
+		} else {
+			// Rule-intrinsically eligible, so it failed on this specific call: a
+			// different arguments hash, a different working directory, or a target
+			// that only matched as requested text and never resolved.
+			hints.push(
+				`allow-exact ${rule.id} matches this target but does not pin this call in this ` +
+					`working directory, so it is advisory only — ${rule.reason}`,
 			);
 		}
 	}

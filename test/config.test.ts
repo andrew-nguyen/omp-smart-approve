@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import path from "node:path";
 import {
 	argumentSizeThreshold,
+	BUILTIN_RULES,
 	CONFIG_FILENAME,
 	ConfigError,
 	computeDeadlineBudget,
@@ -166,7 +167,7 @@ describe("layer precedence", () => {
 		expect(resolved.ready).toBe(true);
 	});
 
-	test("a nearer layer overrides only the rule IDs it explicitly redefines", () => {
+	test("a project layer may add rule IDs but may not redefine one from a broader layer", () => {
 		const resolved = resolveConfig(
 			[
 				layer("user", "/u.yml", {
@@ -176,16 +177,22 @@ describe("layer precedence", () => {
 					],
 				}),
 				layer("project", "/p.yml", {
-					rules: [{ id: "no-env", kind: "deny-exact", tool: "read", target: ".env", reason: "tighter" }],
+					rules: [
+						{ id: "no-env", kind: "deny-exact", tool: "read", target: ".env", reason: "tighter" },
+						{ id: "no-tmp", kind: "deny-pattern", tool: "write", target: "/tmp/**", reason: "added" },
+					],
 				}),
 			],
 			[],
 			paths,
 		);
 		const byId = new Map(resolved.rules.map(r => [r.id, r]));
-		expect(byId.get("no-env")?.kind).toBe("deny-exact");
-		expect(byId.get("no-env")?.reason).toBe("tighter");
-		// The user rule the project never mentioned survives.
+		// The user definition survives the project file's attempt to replace it.
+		expect(byId.get("no-env")?.kind).toBe("deny-pattern");
+		expect(byId.get("no-env")?.reason).toBe("secrets");
+		expect(resolved.warnings.join(" ")).toContain('/p.yml redefines rule "no-env"');
+		// A brand-new project rule is kept, as is the user rule nobody mentioned.
+		expect(byId.get("no-tmp")?.createdBy).toBe("project");
 		expect(byId.get("no-ssh")?.target).toBe("~/.ssh/**");
 	});
 
@@ -353,6 +360,137 @@ describe("warnings rather than silent degradation", () => {
 	});
 });
 
+describe("the builtin deny floor", () => {
+	const HASH = "a".repeat(64);
+
+	test("ships with a zero-config install", () => {
+		const resolved = resolveConfig([], [], paths);
+		const byId = new Map(resolved.rules.map(r => [r.id, r]));
+		for (const rule of BUILTIN_RULES) {
+			expect(byId.get(rule.id)?.target).toBe(rule.target);
+			expect(byId.get(rule.id)?.createdBy).toBe("builtin");
+		}
+	});
+
+	test("a user-scope file may redefine a builtin, because only a human writes that file", () => {
+		const resolved = resolveConfig(
+			[
+				layer("user", "/home/dev/.omp/agent/smart-approve.yml", {
+					rules: [
+						{
+							id: "builtin:nested-agent-no-extensions",
+							kind: "deny-exact",
+							tool: "bash",
+							target: "--no-extensions",
+							sensitivity: "strict",
+							reason: "kept, but I want it tool-scoped my way",
+						},
+					],
+				}),
+			],
+			[],
+			paths,
+		);
+		const rule = resolved.rules.find(r => r.id === "builtin:nested-agent-no-extensions");
+		expect(rule?.createdBy).toBe("user");
+		expect(rule?.reason).toBe("kept, but I want it tool-scoped my way");
+	});
+
+	test("a project-scope file cannot redefine a builtin, and the attempt is reported", () => {
+		const resolved = resolveConfig(
+			[
+				layer("project", "/repo/project/.omp/smart-approve.yml", {
+					rules: [
+						{
+							id: "builtin:nested-agent-no-extensions",
+							kind: "allow-pattern",
+							tool: "bash",
+							target: "**",
+							reason: "please stop blocking me",
+						},
+					],
+				}),
+			],
+			[],
+			paths,
+		);
+		const rule = resolved.rules.find(r => r.id === "builtin:nested-agent-no-extensions");
+		expect(rule?.kind).toBe("deny-exact");
+		expect(rule?.createdBy).toBe("builtin");
+		expect(resolved.warnings.join(" ")).toContain("builtin defaults");
+		expect(resolved.warnings.join(" ")).toContain('redefines rule "builtin:nested-agent-no-extensions"');
+	});
+
+	test("a pinned project-scope allow is demoted, and the operator is told why", () => {
+		const resolved = resolveConfig(
+			[
+				layer("project", "/repo/project/.omp/smart-approve.yml", {
+					rules: [
+						{
+							id: "pin",
+							kind: "allow-exact",
+							tool: "bash",
+							target: "scripts/x.sh",
+							argumentsHash: HASH,
+							cwd: "/repo/project",
+							reason: "pinned",
+						},
+					],
+				}),
+			],
+			[],
+			paths,
+		);
+		expect(resolved.warnings.join(" ")).toContain("project-scope allows never skip the judge");
+	});
+
+	test("a pinned user-scope allow with a relative cwd is demoted, and the operator is told why", () => {
+		const resolved = resolveConfig(
+			[
+				layer("user", "/home/dev/.omp/agent/smart-approve.yml", {
+					rules: [
+						{
+							id: "pin",
+							kind: "allow-exact",
+							tool: "bash",
+							target: "scripts/x.sh",
+							argumentsHash: HASH,
+							cwd: ".",
+							reason: "pinned",
+						},
+					],
+				}),
+			],
+			[],
+			paths,
+		);
+		expect(resolved.warnings.join(" ")).toContain('its cwd "." is not absolute');
+	});
+
+	test("a pinned user-scope allow with an absolute cwd draws no warning", () => {
+		const resolved = resolveConfig(
+			[
+				layer("user", "/home/dev/.omp/agent/smart-approve.yml", {
+					rules: [
+						{
+							id: "pin",
+							kind: "allow-exact",
+							tool: "bash",
+							target: "scripts/x.sh",
+							argumentsHash: HASH,
+							cwd: "/repo/project",
+							reason: "pinned",
+						},
+					],
+				}),
+			],
+			[],
+			paths,
+		);
+		expect(resolved.warnings.join(" ")).not.toContain("pins an exact call");
+	});
+});
+
 describe("sensitivity precedence", () => {
 	const config = smartApproveConfigSchema.parse({
 		sensitivity: {
@@ -431,6 +569,7 @@ describe("rule specificity", () => {
 			[],
 			paths,
 		);
-		expect(resolved.rules[0]?.id).toBe("narrow");
+		const ids = resolved.rules.map(r => r.id);
+		expect(ids.indexOf("narrow")).toBeLessThan(ids.indexOf("broad"));
 	});
 });

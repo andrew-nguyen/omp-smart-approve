@@ -18,6 +18,7 @@
  * and it leaves an audit trail.
  */
 
+import path from "node:path";
 import { grantAuthority, hasHumanChannel, heldCall, queueDepth } from "./broker.ts";
 import {
 	CONFIG_FILENAME,
@@ -170,10 +171,14 @@ const RULE_POSTURE: Record<Exclude<RuleKind, "allow-exact">, string> = {
  * What this rule will actually do, derived from the same predicate
  * {@link matchExactAllow} applies — never from `kind` alone.
  *
- * An `allow-exact` qualifies to skip the judge only when it is exact AND pins the
- * literal call AND names a working directory. Labelling every `allow-exact` as a
- * judge bypass would tell an operator the gate is open on a rule that is in fact
+ * An `allow-exact` qualifies to skip the judge only when it is exact AND pins
+ * the literal call AND names an absolute working directory AND was written by a
+ * human into the user-scope file. Labelling every `allow-exact` as a judge
+ * bypass would tell an operator the gate is open on a rule that is in fact
  * advisory, which is precisely the misreading this command exists to prevent.
+ *
+ * Keep this list in step with `matchExactAllow`; it is the operator-facing half
+ * of the same decision.
  */
 export function rulePosture(rule: PolicyRule): string {
 	if (rule.kind !== "allow-exact") return RULE_POSTURE[rule.kind];
@@ -181,9 +186,18 @@ export function rulePosture(rule: PolicyRule): string {
 	if (!isExactTarget(rule.target)) missing.push("target is a pattern");
 	if (rule.argumentsHash === undefined) missing.push("no argumentsHash");
 	if (rule.cwd === undefined) missing.push("no cwd");
+	else if (!path.isAbsolute(rule.cwd)) missing.push("cwd is not absolute");
+	if (rule.createdBy === "project") missing.push("project-scope file");
 	return missing.length === 0
 		? "exact allow — skips the judge for this precise call in this directory"
 		: `advisory posture — still judged (${missing.join(", ")})`;
+}
+
+/** How `rules show` renders `cwd`, naming the reason a value cannot bind a location. */
+function cwdField(rule: PolicyRule): string {
+	if (rule.cwd === undefined) return "(absent — cannot skip the judge)";
+	if (!path.isAbsolute(rule.cwd)) return `${rule.cwd} (relative — cannot skip the judge)`;
+	return rule.cwd;
 }
 
 /**
@@ -446,8 +460,9 @@ async function rules(deps: CommandDeps, args: string[]): Promise<CommandResult> 
 		}
 		lines.push(
 			"An allow skips the judge only when it is exact AND pins the call with an",
-			"argumentsHash AND names a cwd. Omit any one and it is advisory posture:",
-			"the call is still judged. Use `rules show <id>` to see which field is missing.",
+			"argumentsHash AND names an absolute cwd AND comes from the user-scope",
+			"configuration. Omit any one and it is advisory posture: the call is still",
+			"judged. Use `rules show <id>` to see which condition is missing.",
 		);
 		return { lines };
 	}
@@ -465,12 +480,12 @@ async function rules(deps: CommandDeps, args: string[]): Promise<CommandResult> 
 				`  tool:        ${rule.toolName}`,
 				`  target:      ${rule.target}${isExactTarget(rule.target) ? " (exact)" : " (pattern)"}`,
 				`  argsHash:    ${rule.argumentsHash ?? "(absent — cannot skip the judge)"}`,
-				`  cwd:         ${rule.cwd ?? "(absent — cannot skip the judge)"}`,
+				`  cwd:         ${cwdField(rule)}`,
 				`  operation:   ${rule.operation ?? "(any)"}`,
 				`  risk:        ${rule.risk ?? "(any)"}`,
 				`  sensitivity: ${rule.sensitivity ?? "(inherit)"}`,
 				`  specificity: ${rule.specificity}`,
-				`  created by:  ${rule.createdBy}`,
+				`  created by:  ${rule.createdBy}${rule.createdBy === "project" ? " (project scope never skips the judge)" : ""}`,
 				`  source:      ${rule.source ?? "(unknown)"}`,
 				`  reason:      ${rule.reason}`,
 			],

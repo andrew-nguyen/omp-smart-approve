@@ -408,6 +408,39 @@ describe("buildJudgeMessages", () => {
 		expect(text).toMatch(/only `escalate` or `block` are permitted/i);
 	});
 
+	test("the taxonomy names disabling the gate, not only modifying it", () => {
+		// An env assignment or a CLI flag removes the gate from the child process
+		// without writing anything, so "modifies" alone left no risk class fitting
+		// and the decision boundary then routed the call to `escalate`.
+		const text = buildJudgeMessages(input()).systemPrompt.join("\n");
+
+		expect(text).toContain("modifies or disables");
+		expect(text).toContain("--no-extensions");
+		expect(text).toContain("--dangerously-skip-permissions");
+		expect(text).toContain("OMP_DISABLE_*");
+		expect(text).toMatch(/safety-tampering, not uncertainty/);
+	});
+
+	test("block may cite the tool call itself, not only the quoted evidence", () => {
+		const text = buildJudgeMessages(input()).systemPrompt.join("\n");
+
+		expect(text).toContain("in the tool call, the evidence, or the authoritative policy");
+	});
+
+	test("the system prompt defines all three sensitivity postures and pins the block boundary", () => {
+		// `buildJudgeMessages` states the posture by name; without these lines the
+		// word cannot move a decision. The bullets are scoped to the allow/escalate
+		// choice because an unscoped "prefer escalate" downgrades clear violations.
+		const text = buildJudgeMessages(input()).systemPrompt.join("\n");
+
+		expect(text).toContain("SENSITIVITY POSTURE");
+		expect(text).toMatch(/- permissive: between those two, prefer `allow`/);
+		expect(text).toMatch(/- balanced: between those two, prefer `escalate`/);
+		expect(text).toMatch(/- strict: between those two, prefer `escalate`/);
+		expect(text).toContain("A clear violation is `block` at every posture");
+		expect(text).toMatch(/never turns a `block` into an `escalate`/);
+	});
+
 	test("the system prompt demands one raw JSON object with no fences and no prose", () => {
 		const text = buildJudgeMessages(input()).systemPrompt.join("\n");
 
