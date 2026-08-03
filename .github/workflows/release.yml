@@ -4,6 +4,11 @@ on:
   push:
     branches: [trunk]
   workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: "Existing tag to (re)publish to npm, e.g. v0.1.1. Leave empty for a normal release run."
+        required: false
+        default: ""
 
 permissions: {}
 
@@ -29,7 +34,10 @@ jobs:
 
   publish:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # Normal path: release-please just cut a release. Recovery path: a manual
+    # dispatch naming an existing tag whose npm publish failed — retrying must
+    # never require minting a new version.
+    if: ${{ needs.release-please.outputs.release_created == 'true' || inputs.publish_tag != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -37,6 +45,8 @@ jobs:
       id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.publish_tag }} # empty = the triggering commit
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
@@ -47,10 +57,21 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
+      # No registry-url: setup-node would write an .npmrc pinning
+      # _authToken=${NODE_AUTH_TOKEN} unconditionally, and an unset var leaves
+      # an empty credential that defeats the OIDC exchange. Default registry
+      # is registry.npmjs.org anyway.
+      - name: OIDC preflight
+        run: |
+          echo "npm            : $(npm --version)  (trusted publishing needs >= 11.5.1)"
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then oidc=present; else oidc=MISSING; fi
+          echo "OIDC token url : $oidc"
+          echo "npm userconfig : ${NPM_CONFIG_USERCONFIG:-<unset>}"
+          echo "registry       : $(npm config get registry)"
+          echo "repository.url : $(node -p "require('./package.json').repository.url")"
       # Tokenless: npm exchanges the Actions OIDC token for a short-lived
       # publish credential via the trusted publisher configured on npmjs.com
-      # (andrew-nguyen/omp-smart-approve, workflow release.yml). Deliberately
-      # no NODE_AUTH_TOKEN — setting it suppresses OIDC.
-      - run: npm publish --provenance --access public
+      # (andrew-nguyen/omp-smart-approve, workflow release.yml, allowed action
+      # "npm publish"). Provenance is automatic under trusted publishing.
+      - run: npm publish --access public
