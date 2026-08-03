@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/andrew-nguyen/omp-smart-approve/compare/v0.1.0...v0.1.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* add repository metadata required for npm trusted publishing ([ee935fa](https://github.com/andrew-nguyen/omp-smart-approve/commit/ee935fa0275d72629dc8e2cca761b4a5ec740a5b))
+
 ## 0.1.0 (2026-08-03)
 
 
