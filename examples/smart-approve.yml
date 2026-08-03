@@ -274,30 +274,36 @@ rules:
   # redefinition there is ignored with a warning, so a cloned repository cannot
   # lower the floor.
   #
+  # They are `tool: "*"`, not `tool: bash`: command targets come from any
+  # `command` argument whatever the tool is called, so an MCP server exposing
+  # `run({command})` produces the same targets and a bash-scoped rule would miss
+  # it. These targets are flag-shaped or prefix-anchored, so unlike a bare word
+  # such as `terraform` they cannot collide with a plausible path.
+  #
   # - id: builtin:nested-agent-no-extensions
   #   kind: deny-exact
-  #   tool: bash
+  #   tool: "*"
   #   target: "--no-extensions"
   #   risk: safety-tampering
   #   reason: Disables extension discovery, so Smart Approve does not load in the nested session.
   #
   # - id: builtin:nested-agent-skip-permissions
   #   kind: deny-exact
-  #   tool: bash
+  #   tool: "*"
   #   target: "--dangerously-skip-permissions"
   #   risk: safety-tampering
   #   reason: Runs a nested agent with its approval prompts disabled; that session is outside this gate.
   #
   # - id: builtin:disable-env-assignment-omp
   #   kind: deny-pattern
-  #   tool: bash
+  #   tool: "*"
   #   target: "OMP_DISABLE_*=*"
   #   risk: safety-tampering
   #   reason: Environment kill switch aimed at omp's extension loading.
   #
   # - id: builtin:disable-env-assignment-pi
   #   kind: deny-pattern
-  #   tool: bash
+  #   tool: "*"
   #   target: "PI_DISABLE_*=*"
   #   risk: safety-tampering
   #   reason: Environment kill switch aimed at omp's extension loading, PI_ prefix.

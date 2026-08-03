@@ -265,12 +265,20 @@ its extension or approval layer switched off removes it from the child process
 without writing anything, so four rules ship in the built-in deny floor and
 apply with zero configuration:
 
-| Rule ID | Denies on `bash` |
+| Rule ID | Denied target |
 | --- | --- |
 | `builtin:nested-agent-no-extensions` | `--no-extensions` |
 | `builtin:nested-agent-skip-permissions` | `--dangerously-skip-permissions` |
 | `builtin:disable-env-assignment-omp` | `OMP_DISABLE_*=*` |
 | `builtin:disable-env-assignment-pi` | `PI_DISABLE_*=*` |
+
+All four are `tool: "*"`, not `tool: bash`. Command targets are extracted from
+any `command` argument regardless of what the tool is called, so an MCP server
+exposing `run({command})` produces byte-identical targets; scoping these to
+`bash` would let that straight through. The cost is a narrow false-block
+surface — a target whose own literal text *is* one of these strings, such as a
+file named `--no-extensions` — which is a human-overridable block on an absurd
+path, against a miss that is a silent gate removal.
 
 `omp -p "…"` itself is **not** denied: the child still loads this plugin and
 still judges every call it makes, so denying it would break delegation without
@@ -278,6 +286,15 @@ closing anything. Nor is `--approval-mode=yolo` — it widens what OMP
 auto-approves, and every one of those calls still reaches this gate.
 
 A user-scope file may redefine any of these by ID. A project file may not.
+
+**Known limitation.** This floor matches *targets*, and targets come from a
+`command` string. A process launch expressed as an argv array instead —
+`{application: "omp", args: ["--no-extensions", …]}` — produces no command
+target, so no deny rule can see it, at any tool scope. The same is true of a
+command buried inside an `xd://` device payload, which arrives as an unparsed
+JSON string. Both still reach the judge with their arguments intact, so they are
+judged rather than unseen; it is the *deterministic* layer that has the hole.
+Tracked in [issue #1](https://github.com/andrew-nguyen/omp-smart-approve/issues/1).
 
 ---
 

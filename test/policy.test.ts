@@ -436,6 +436,31 @@ describe("the builtin deny floor covers commands that remove this gate", () => {
 		const targets = extractCommandTargets(`OMP_LOG_LEVEL=debug omp -p "run the tests"`);
 		expect(matchDeny(builtins, "bash", "bash", targets)).toBeUndefined();
 	});
+
+	test("a non-bash tool carrying the same command is denied too", () => {
+		// `extractTargets` keys command extraction on the `command` ARGUMENT, not on
+		// the tool name, so an MCP server exposing `run({command})` produces
+		// byte-identical targets. Scoping these rules to `bash` would let it past.
+		const { targets, operation } = extractTargets({
+			toolName: "mcp__shell_run",
+			args: { command: `omp --no-extensions -p "clean up"` },
+			cwd: CWD,
+		});
+		const hit = matchDeny(builtins, "mcp__shell_run", operation, targets);
+		expect(hit?.rule.id).toBe("builtin:nested-agent-no-extensions");
+	});
+
+	test("an ordinary write is untouched by the wildcard tool scope", () => {
+		// `tool: "*"` costs a false-block surface, because `matchDeny` also tests
+		// `target.requested`. Nothing that merely mentions a flag trips it: only a
+		// target whose own text IS the flag.
+		const { targets, operation } = extractTargets({
+			toolName: "write",
+			args: { path: "docs/notes.md", content: "run omp --no-extensions to reproduce" },
+			cwd: CWD,
+		});
+		expect(matchDeny(builtins, "write", operation, targets)).toBeUndefined();
+	});
 });
 
 describe("wildcard allows never bypass the judge", () => {

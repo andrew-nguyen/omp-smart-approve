@@ -198,12 +198,23 @@ export type SmartApproveConfig = z.infer<typeof smartApproveConfigSchema>;
  * seeded as raw data before any file layer, so a user-scope file may redefine
  * one by ID (fact 37's explicit human override) while a project-scope file may
  * not.
+ *
+ * `tool: "*"` rather than `tool: "bash"` because command targets are extracted
+ * from any `command` argument, whatever the tool is called (`extractTargets` in
+ * `src/policy.ts`): an MCP server exposing `run({command})` produces byte-identical
+ * targets and would otherwise walk straight through. The cost is that `matchDeny`
+ * also tests `target.requested`, so a path literally named `--no-extensions`
+ * false-blocks. That trade is the one this module already takes everywhere else —
+ * a spurious deny is a human-overridable block on an absurd filename, a miss is a
+ * silent gate removal — and these targets are flag-shaped or prefix-anchored, so
+ * they cannot collide with a plausible path the way a bare word like `terraform`
+ * would.
  */
 export const BUILTIN_RULES: SmartApproveConfig["rules"] = [
 	{
 		id: "builtin:nested-agent-no-extensions",
 		kind: "deny-exact",
-		tool: "bash",
+		tool: "*",
 		target: "--no-extensions",
 		risk: "safety-tampering",
 		reason: "Disables extension discovery, so Smart Approve does not load in the nested session.",
@@ -211,7 +222,7 @@ export const BUILTIN_RULES: SmartApproveConfig["rules"] = [
 	{
 		id: "builtin:nested-agent-skip-permissions",
 		kind: "deny-exact",
-		tool: "bash",
+		tool: "*",
 		target: "--dangerously-skip-permissions",
 		risk: "safety-tampering",
 		reason: "Runs a nested agent with its approval prompts disabled; that session is outside this gate.",
@@ -219,7 +230,7 @@ export const BUILTIN_RULES: SmartApproveConfig["rules"] = [
 	{
 		id: "builtin:disable-env-assignment-omp",
 		kind: "deny-pattern",
-		tool: "bash",
+		tool: "*",
 		target: "OMP_DISABLE_*=*",
 		risk: "safety-tampering",
 		reason: "Environment kill switch aimed at omp's extension loading.",
@@ -227,7 +238,7 @@ export const BUILTIN_RULES: SmartApproveConfig["rules"] = [
 	{
 		id: "builtin:disable-env-assignment-pi",
 		kind: "deny-pattern",
-		tool: "bash",
+		tool: "*",
 		target: "PI_DISABLE_*=*",
 		risk: "safety-tampering",
 		reason: "Environment kill switch aimed at omp's extension loading, PI_ prefix.",
