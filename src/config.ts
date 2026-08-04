@@ -35,12 +35,35 @@ export const MAX_SELF_DEADLINE_MS = 29_000;
 const sensitivitySchema = z.enum(SENSITIVITY_LEVELS);
 const riskSchema = z.enum(RISK_CLASSES);
 
+/**
+ * One token of an `allow-command` prefix. Whitespace and shell metacharacters are
+ * rejected at load time: argv tokens never contain either, so a rule spelled
+ * `["git log"]` or `["git", "log; curl"]` could only ever be a mistake — and it
+ * would be a silent one, since it can never match a parsed token.
+ */
+const commandTokenSchema = z
+	.string()
+	.min(1)
+	.regex(/^[^\s;&|<>$`(){}[\]*?~!#\\'"]+$/, "must be one literal argv token with no shell metacharacters");
+
 const ruleSchema = z
 	.object({
 		id: z.string().min(1),
-		kind: z.enum(["allow-exact", "allow-pattern", "deny-exact", "deny-pattern", "posture"]),
+		kind: z.enum(["allow-exact", "allow-command", "allow-pattern", "deny-exact", "deny-pattern", "posture"]),
 		tool: z.string().min(1),
-		target: z.string().min(1),
+		/** Canonical target, or a glob/regex for pattern kinds. Unused by `allow-command`. */
+		target: z.string().min(1).optional(),
+		/**
+		 * Literal argv prefix for an `allow-command` rule: `[git, log]` admits
+		 * `git log --oneline -n 20` and nothing that is not a single plain command.
+		 *
+		 * This is the one allow that matches a family rather than a pinned call, so
+		 * it carries its own screens (`src/policy.ts` `matchAllowCommand`) rather
+		 * than a hash: composition, redirection, substitution, globbing, an
+		 * environment prefix, a write/retarget/execute flag, a revision-path
+		 * operand, or a credential-shaped operand each send the call to the judge.
+		 */
+		command: z.array(commandTokenSchema).min(1).optional(),
 		operation: z.string().min(1).optional(),
 		sensitivity: sensitivitySchema.optional(),
 		risk: riskSchema.optional(),
@@ -72,7 +95,36 @@ const ruleSchema = z
 		cwd: z.string().min(1).optional(),
 		reason: z.string().min(1).default("no reason given"),
 	})
-	.strict();
+	.strict()
+	.superRefine((rule, ctx) => {
+		// The two shapes are mutually exclusive on purpose. A rule carrying both
+		// would have to be matched two ways, and the narrower reading is the one an
+		// operator would not expect.
+		if (rule.kind === "allow-command") {
+			if (rule.command === undefined) {
+				ctx.addIssue({ code: "custom", path: ["command"], message: "allow-command requires a command prefix" });
+			}
+			if (rule.target !== undefined) {
+				ctx.addIssue({ code: "custom", path: ["target"], message: "allow-command matches argv, not a target" });
+			}
+			// A hash pins one literal call; this kind exists precisely to admit a
+			// family. Accepting both would silently ignore one of them.
+			if (rule.argumentsHash !== undefined) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["argumentsHash"],
+					message: "allow-command cannot pin an arguments hash; use allow-exact for one literal call",
+				});
+			}
+			return;
+		}
+		if (rule.target === undefined) {
+			ctx.addIssue({ code: "custom", path: ["target"], message: `${rule.kind} requires a target` });
+		}
+		if (rule.command !== undefined) {
+			ctx.addIssue({ code: "custom", path: ["command"], message: "only allow-command accepts a command prefix" });
+		}
+	});
 
 const judgeSchema = z
 	.object({
@@ -242,6 +294,110 @@ export const BUILTIN_RULES: SmartApproveConfig["rules"] = [
 		target: "PI_DISABLE_*=*",
 		risk: "safety-tampering",
 		reason: "Environment kill switch aimed at omp's extension loading, PI_ prefix.",
+	},
+];
+
+/**
+ * Read-only command floor that ships with the plugin.
+ *
+ * Every scoped call otherwise costs a model round trip, and the overwhelmingly
+ * common case is an agent orienting itself: `git status`, `git log`, `git diff`.
+ * Judging those buys nothing — there is no verdict a judge can reach that these
+ * commands could act on, because none of them can write, execute, or transmit —
+ * while the cost is latency, spend, and a verdict that is a model opinion rather
+ * than a fact. Worse, a per-call opinion is nondeterministic: verdicts are never
+ * cached, so the same `git log` can be allowed twice and escalated the third time.
+ *
+ * These are prefixes, not patterns. `matchAllowCommand` (`src/policy.ts`) admits
+ * one only after the command parses as a single literal command and every token
+ * clears the write/retarget/execute screens, so the family is bounded by
+ * construction rather than by a glob an injected agent could thread.
+ *
+ * `tool: "bash"` and not `"*"`: the screens reason about a shell command line, so
+ * an MCP tool that happens to accept `{command}` is judged rather than assumed to
+ * have shell semantics. Operators can add rules for their own tools.
+ *
+ * Deliberately absent: `cat`, `head`, `tail`, and friends. They read arbitrary
+ * file content, which is the deterministic protected-path floor's business, and a
+ * blanket allow would route around it for anything git-tracked or unusually named.
+ */
+export const BUILTIN_COMMAND_ALLOWS: SmartApproveConfig["rules"] = [
+	{
+		id: "builtin:git-status",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "status"],
+		reason: "Reports the working tree state; cannot write, execute, or transmit.",
+	},
+	{
+		id: "builtin:git-log",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "log"],
+		reason: "Prints commit history; cannot write, execute, or transmit.",
+	},
+	{
+		id: "builtin:git-diff",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "diff"],
+		reason: "Prints tracked-file differences; cannot write, execute, or transmit.",
+	},
+	{
+		id: "builtin:git-show",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "show"],
+		reason: "Prints objects already in history; revision-path operands are screened out.",
+	},
+	{
+		id: "builtin:git-branch",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "branch"],
+		reason: "Lists branches; the deleting and moving flags are screened out.",
+	},
+	{
+		id: "builtin:git-rev-parse",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "rev-parse"],
+		reason: "Resolves a revision to a hash; produces no side effect.",
+	},
+	{
+		id: "builtin:git-describe",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "describe"],
+		reason: "Names the nearest tag; produces no side effect.",
+	},
+	{
+		id: "builtin:git-blame",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["git", "blame"],
+		reason: "Attributes tracked lines to commits; produces no side effect.",
+	},
+	{
+		id: "builtin:pwd",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["pwd"],
+		reason: "Prints the working directory.",
+	},
+	{
+		id: "builtin:ls",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["ls"],
+		reason: "Lists directory entries; credential-shaped operands are screened out.",
+	},
+	{
+		id: "builtin:wc",
+		kind: "allow-command",
+		tool: "bash",
+		command: ["wc"],
+		reason: "Counts lines, words, or bytes; credential-shaped operands are screened out.",
 	},
 ];
 
@@ -493,17 +649,23 @@ export interface ResolvedConfig {
 /** Deny wins at equal specificity; exact beats patterned; narrower beats broader. */
 export function ruleSpecificity(rule: {
 	kind: PolicyRule["kind"];
-	target: string;
+	target?: string | undefined;
+	command?: readonly string[] | undefined;
 	operation?: string | undefined;
 	risk?: string | undefined;
 }): number {
 	let score = 0;
 	if (rule.kind === "allow-exact" || rule.kind === "deny-exact") score += 400;
+	// An argv prefix is literal, so it ranks with the exact kinds rather than the
+	// patterned ones — but below `allow-exact`, which pins one whole call.
+	else if (rule.kind === "allow-command") score += 300;
 	else if (rule.kind === "deny-pattern" || rule.kind === "allow-pattern") score += 200;
 	if (rule.operation) score += 40;
 	if (rule.risk) score += 20;
-	// A longer literal target is a narrower match.
-	score += Math.min(19, Math.floor(rule.target.length / 8));
+	// A longer literal target is a narrower match. A longer argv prefix likewise:
+	// `git log` is narrower than `git`.
+	const literal = rule.command === undefined ? (rule.target ?? "") : rule.command.join(" ");
+	score += Math.min(19, Math.floor(literal.length / 8));
 	// Deny outranks allow at otherwise equal specificity.
 	if (rule.kind === "deny-exact" || rule.kind === "deny-pattern") score += 1;
 	return score;
@@ -518,7 +680,10 @@ function toPolicyRules(
 		id: r.id,
 		kind: r.kind,
 		toolName: r.tool,
-		target: r.target,
+		// An `allow-command` rule matches argv, so it has no target of its own; the
+		// joined prefix stands in for display, listing, and specificity.
+		target: r.target ?? (r.command === undefined ? "" : r.command.join(" ")),
+		...(r.command === undefined ? {} : { command: [...r.command] }),
 		...(r.operation === undefined ? {} : { operation: r.operation }),
 		...(r.sensitivity === undefined ? {} : { sensitivity: r.sensitivity }),
 		...(r.risk === undefined ? {} : { risk: r.risk }),
@@ -579,7 +744,7 @@ export function resolveConfig(
 
 	const merged: Record<string, unknown> = {};
 	const rawRuleById = new Map<string, { rule: unknown; scope: "builtin" | "user" | "project"; source: string }>();
-	for (const rule of BUILTIN_RULES) {
+	for (const rule of [...BUILTIN_RULES, ...BUILTIN_COMMAND_ALLOWS]) {
 		rawRuleById.set(rule.id, { rule, scope: "builtin", source: "builtin defaults" });
 	}
 

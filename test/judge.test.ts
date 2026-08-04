@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { smartApproveConfigSchema } from "../src/config.ts";
+import { EVIDENCE_CLOSE, EVIDENCE_OPEN } from "../src/context.ts";
 import type { JudgeInput } from "../src/contracts.ts";
 import { buildJudgeMessages, createJudge, type JudgePorts, parseVerdict } from "../src/judge.ts";
 
@@ -68,6 +69,8 @@ function input(overrides: Partial<JudgeInput> = {}): JudgeInput {
 	return {
 		userIntent: "clean up the build output",
 		agentRationale: "removing the generated dist directory",
+		rationaleFreshness: "current-turn",
+		rationaleFromReasoning: false,
 		toolName: "bash",
 		operation: "exec",
 		argumentsView: "rm -rf ./dist",
@@ -550,6 +553,65 @@ describe("buildJudgeMessages", () => {
 
 		expect(first).not.toBe(second);
 		expect(first).toEqual(second);
+	});
+
+	test("an absent rationale renders a placeholder, never an empty fence", () => {
+		// The observed cascade started here: an empty `UNTRUSTED_EVIDENCE` block,
+		// which the judge reported as the agent supplying no content — and treated as
+		// a fact about the agent rather than a gap in the capture.
+		const { userMessage } = buildJudgeMessages(input({ agentRationale: "", rationaleFreshness: "none" }));
+
+		expect(userMessage).toContain("(no stated rationale)");
+		expect(userMessage).toContain("The agent stated no reason for this call.");
+		expect(userMessage).not.toContain(`${EVIDENCE_OPEN}\n\n${EVIDENCE_CLOSE}`);
+	});
+
+	test("a stated rationale is fenced as inert evidence inside its labeled block", () => {
+		const { userMessage } = buildJudgeMessages(input({ agentRationale: "listing the staged paths" }));
+
+		expect(userMessage).toContain(
+			`<<<SA-EVIDENCE:agent-rationale>>>\n${EVIDENCE_OPEN}\nlisting the staged paths\n${EVIDENCE_CLOSE}`,
+		);
+	});
+
+	test("the rationale header says whether the statement can speak for this call", () => {
+		const current = buildJudgeMessages(input({ rationaleFreshness: "current-turn" })).userMessage;
+		const previous = buildJudgeMessages(input({ rationaleFreshness: "previous-turn" })).userMessage;
+
+		expect(current).toContain("The coding agent's stated reason for this call");
+		expect(previous).toContain("may predate this call");
+		expect(previous).toMatch(/do not read it as this call's justification or as an admission about it/);
+		expect(current).not.toContain("may predate this call");
+	});
+
+	test("a reasoning-derived rationale is not presented as something the agent said", () => {
+		const { userMessage } = buildJudgeMessages(
+			input({ agentRationale: "weighing which files matter", rationaleFromReasoning: true }),
+		);
+
+		expect(userMessage).toContain("the model's own reasoning");
+		expect(userMessage).toContain("this turn stated no prose");
+	});
+
+	test("an absent intent is presented as a coverage limit, not as the user asking for nothing", () => {
+		const { userMessage } = buildJudgeMessages(input({ userIntent: "" }));
+
+		expect(userMessage).toContain("none captured this session");
+		expect(userMessage).toContain("absence is a coverage limitation, not evidence that no request exists");
+	});
+
+	test("the system prompt states the missing-intent posture exactly once", () => {
+		const text = buildJudgeMessages(input()).systemPrompt.join("\n");
+
+		expect(text.split("WHAT THE EVIDENCE CHANNELS CAN AND CANNOT SHOW.").length - 1).toBe(1);
+		expect(text).toContain("not that the user asked for nothing");
+		expect(text).toMatch(/prefer `escalate` over `allow` for anything consequential/);
+		expect(text).toMatch(
+			/Do not classify such a claim as fabrication or prompt-injection unless positive evidence/,
+		);
+		expect(text).toContain("Absent evidence is not contrary evidence.");
+		// The exemption must not become a loophole.
+		expect(text).toMatch(/clear violation: that is `block` regardless/);
 	});
 });
 

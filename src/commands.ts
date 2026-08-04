@@ -159,7 +159,7 @@ function recordOperatorEvent(deps: CommandDeps, type: AuditEventType, operation:
 }
 
 /** Posture for the kinds whose behavior does not depend on how complete the rule is. */
-const RULE_POSTURE: Record<Exclude<RuleKind, "allow-exact">, string> = {
+const RULE_POSTURE: Record<Exclude<RuleKind, "allow-exact" | "allow-command">, string> = {
 	"allow-pattern": "posture hint only — never skips the judge",
 	"deny-exact": "exact deny — blocks before any model call",
 	"deny-pattern": "patterned deny — blocks before any model call",
@@ -167,19 +167,31 @@ const RULE_POSTURE: Record<Exclude<RuleKind, "allow-exact">, string> = {
 };
 
 /**
- * What this rule will actually do, derived from the same predicate
- * {@link matchExactAllow} applies — never from `kind` alone.
+ * What this rule will actually do, derived from the same predicates
+ * {@link matchExactAllow} and {@link matchAllowCommand} apply — never from `kind`
+ * alone.
  *
  * An `allow-exact` qualifies to skip the judge only when it is exact AND pins
  * the literal call AND names an absolute working directory AND was written by a
- * human into the user-scope file. Labelling every `allow-exact` as a judge
- * bypass would tell an operator the gate is open on a rule that is in fact
- * advisory, which is precisely the misreading this command exists to prevent.
+ * human into the user-scope file. An `allow-command` qualifies only when it names
+ * an argv prefix and did not arrive in a project-scope file. Labelling either as a
+ * judge bypass unconditionally would tell an operator the gate is open on a rule
+ * that is in fact advisory, which is precisely the misreading this command exists
+ * to prevent.
  *
- * Keep this list in step with `matchExactAllow`; it is the operator-facing half
- * of the same decision.
+ * Keep this in step with those matchers; it is the operator-facing half of the
+ * same decision.
  */
 export function rulePosture(rule: PolicyRule): string {
+	if (rule.kind === "allow-command") {
+		const missing: string[] = [];
+		if ((rule.command?.length ?? 0) === 0) missing.push("no command prefix");
+		if (rule.createdBy === "project") missing.push("project-scope file");
+		return missing.length === 0
+			? `read-only command floor — skips the judge for \`${rule.command?.join(" ")}\` when the ` +
+					`command line is one literal command with no write, retarget, or execute flag`
+			: `advisory posture — still judged (${missing.join(", ")})`;
+	}
 	if (rule.kind !== "allow-exact") return RULE_POSTURE[rule.kind];
 	const missing: string[] = [];
 	if (!isExactTarget(rule.target)) missing.push("target is a pattern");

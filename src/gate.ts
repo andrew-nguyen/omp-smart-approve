@@ -56,7 +56,13 @@ import type {
 	ToolTier,
 	Verdict,
 } from "./contracts.ts";
-import { evaluateDeterministic, hashCanonicalCall, matchExactAllow, retryFamilyKey } from "./policy.ts";
+import {
+	evaluateDeterministic,
+	hashCanonicalCall,
+	matchAllowCommand,
+	matchExactAllow,
+	retryFamilyKey,
+} from "./policy.ts";
 import type { SmartApproveStore } from "./store.ts";
 
 /** How many blocked attempts in one retry family before the loop breaker fires. */
@@ -363,6 +369,33 @@ export class Gate {
 				rationale: `exact allow rule ${exactAllow.id}: ${exactAllow.reason}`,
 				reason: `admitted by exact allow rule ${exactAllow.id}`,
 				matchedRuleId: exactAllow.id,
+				retryFamilyKey: familyKey,
+			});
+		}
+
+		// ------------------------------------------------- read-only command floor
+		// The second rule kind that may skip the judge. Unlike `local-read` this one
+		// is audited: it admits an exec-tier call, so the row is the only record that
+		// the command ran without a verdict, and `matchedRuleId` names the rule that
+		// let it. Placed with the other rule-driven bypasses, before escalation reuse,
+		// so an unrelated open record cannot hold a rule-authorized call hostage.
+		//
+		// It deliberately does NOT clear the retry family, unlike a grant or a pinned
+		// exact allow. Those represent a human acting on this specific call; a floor
+		// match is the agent's own unilateral choice of a safe command. The family key
+		// is coarse by design — for bash it hashes the command-position token, so
+		// `git log` and `git push --force` share one family — which would let an agent
+		// alternate a blocked push with an allowed log and reset its strike count
+		// forever.
+		const safeCommand = matchAllowCommand(this.#allRules(), request.toolName, request.rawArguments);
+		if (safeCommand.kind === "match") {
+			return this.#terminal(request, canonicalHash, targetSummary, {
+				decision: "allow",
+				stage: "allow-command-rule",
+				risk: "uncertain",
+				rationale: `allow-command rule ${safeCommand.rule.id}: ${safeCommand.rule.reason}`,
+				reason: `admitted by allow-command rule ${safeCommand.rule.id}`,
+				matchedRuleId: safeCommand.rule.id,
 				retryFamilyKey: familyKey,
 			});
 		}

@@ -157,6 +157,7 @@ export type GateStage =
 	| "unsupported-host"
 	| "exact-grant"
 	| "exact-allow-rule"
+	| "allow-command-rule"
 	| "local-read"
 	| "oversized-argument"
 	| "sensitive-read"
@@ -197,11 +198,25 @@ export interface ProvenanceEntry {
 	untrusted: boolean;
 }
 
+/**
+ * How closely the recorded rationale tracks the call being judged.
+ *
+ * The host prepares tool dispatch before it publishes the assistant message, so
+ * "the agent's latest completed statement" and "why this call is happening" are
+ * not the same thing. The judge is told which one it is looking at rather than
+ * being left to assume.
+ */
+export type RationaleFreshness = "current-turn" | "previous-turn" | "none";
+
 export interface JudgeInput {
 	/** Most recent direct user request, redacted. */
 	userIntent: string;
-	/** Primary coding agent's stated rationale for this call, redacted. */
+	/** Primary coding agent's stated rationale, redacted and unfenced. */
 	agentRationale: string;
+	/** Whether {@link agentRationale} belongs to the turn issuing this call. */
+	rationaleFreshness: RationaleFreshness;
+	/** True when the turn stated no prose and the text is its reasoning instead. */
+	rationaleFromReasoning: boolean;
 	toolName: string;
 	operation: string;
 	/** Secret-obfuscated, size-bounded view of the arguments. */
@@ -265,7 +280,7 @@ export type SensitivityLevel = (typeof SENSITIVITY_LEVELS)[number];
 // Rules and grants
 // ---------------------------------------------------------------------------
 
-export type RuleKind = "allow-exact" | "allow-pattern" | "deny-exact" | "deny-pattern" | "posture";
+export type RuleKind = "allow-exact" | "allow-command" | "allow-pattern" | "deny-exact" | "deny-pattern" | "posture";
 
 export interface PolicyRule {
 	id: string;
@@ -286,6 +301,13 @@ export interface PolicyRule {
 	argumentsHash?: string;
 	/** Working directory an `allow-exact` rule is bound to. Required to skip the judge. */
 	cwd?: string;
+	/**
+	 * Literal argv prefix an `allow-command` rule matches, e.g. `["git", "log"]`.
+	 *
+	 * A prefix rather than a pattern on purpose: matching happens against parsed
+	 * argv tokens, so there is no glob whose `*` could swallow `; curl evil`.
+	 */
+	command?: readonly string[];
 	reason: string;
 	createdBy: "user" | "project" | "human-override" | "builtin";
 	/** Higher wins. Computed by `ruleSpecificity`. */

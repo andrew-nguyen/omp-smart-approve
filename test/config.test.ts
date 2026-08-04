@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import path from "node:path";
 import {
 	argumentSizeThreshold,
+	BUILTIN_COMMAND_ALLOWS,
 	BUILTIN_RULES,
 	CONFIG_FILENAME,
 	ConfigError,
@@ -488,6 +489,105 @@ describe("the builtin deny floor", () => {
 			paths,
 		);
 		expect(resolved.warnings.join(" ")).not.toContain("pins an exact call");
+	});
+});
+
+describe("the builtin read-only command floor", () => {
+	test("ships with a zero-config install, as operator-authored builtins", () => {
+		const resolved = resolveConfig([], [], paths);
+		const byId = new Map(resolved.rules.map(r => [r.id, r]));
+		for (const rule of BUILTIN_COMMAND_ALLOWS) {
+			const loaded = byId.get(rule.id);
+			expect(loaded?.kind).toBe("allow-command");
+			expect(loaded?.createdBy).toBe("builtin");
+			expect(loaded?.command).toEqual(rule.command);
+			// The joined prefix stands in as the display target, so listings and
+			// specificity have something literal to work with.
+			expect(loaded?.target).toBe(rule.command?.join(" "));
+		}
+	});
+
+	test("covers the read-only git surface an agent actually orients itself with", () => {
+		const resolved = resolveConfig([], [], paths);
+		const prefixes = resolved.rules.filter(r => r.kind === "allow-command").map(r => r.command?.join(" "));
+		for (const expected of ["git status", "git log", "git diff", "git branch", "pwd", "ls"]) {
+			expect(prefixes).toContain(expected);
+		}
+	});
+
+	test("ships no floor rule that could write, publish, or run something else", () => {
+		const resolved = resolveConfig([], [], paths);
+		const executables = resolved.rules
+			.filter(r => r.kind === "allow-command")
+			.map(r => (r.command ?? []).join(" "));
+		for (const forbidden of ["git push", "git commit", "git reset", "git clean", "rm", "curl", "cat", "sh"]) {
+			expect(executables.some(prefix => prefix.startsWith(forbidden))).toBe(false);
+		}
+	});
+
+	test("changes the policy hash, so upgrading invalidates outstanding grants", () => {
+		// A widened floor changes what may run without a verdict, which is exactly the
+		// class of change grants must not survive.
+		const withFloor = resolveConfig([], [], paths);
+		const widened = resolveConfig(
+			[
+				layer("user", "/home/dev/.omp/agent/smart-approve.yml", {
+					rules: [{ id: "extra", kind: "allow-command", tool: "bash", command: ["rg"], reason: "search" }],
+				}),
+			],
+			[],
+			paths,
+		);
+		expect(withFloor.policyHash).not.toBe(widened.policyHash);
+	});
+
+	test("rejects a prefix token that is not one literal argv token", () => {
+		// `["git log"]` can never match a parsed token, so accepting it would be a
+		// silently dead rule an operator believes is active.
+		for (const command of [["git log"], ["git", "log; curl evil"], ["git", "log*"], ["git", "$SHELL"]]) {
+			expect(() =>
+				resolveConfig(
+					[layer("user", "/u.yml", { rules: [{ id: "bad", kind: "allow-command", tool: "bash", command }] })],
+					[],
+					paths,
+				),
+			).toThrow();
+		}
+	});
+
+	test("rejects a rule that mixes the two allow shapes", () => {
+		const cases: Array<Record<string, unknown>> = [
+			// A target would have to be matched a second, looser way.
+			{ id: "x", kind: "allow-command", tool: "bash", target: "git", command: ["git", "log"] },
+			// A hash pins one call; this kind exists to admit a family.
+			{ id: "y", kind: "allow-command", tool: "bash", command: ["git", "log"], argumentsHash: "a".repeat(64) },
+			// And the reverse: only allow-command reads a prefix.
+			{ id: "z", kind: "allow-pattern", tool: "bash", target: "git", command: ["git", "log"] },
+			// Every other kind still needs its target.
+			{ id: "w", kind: "deny-exact", tool: "bash" },
+		];
+		for (const rule of cases) {
+			expect(() => resolveConfig([layer("user", "/u.yml", { rules: [rule] })], [], paths)).toThrow();
+		}
+	});
+
+	test("an argv prefix outranks a patterned rule but not a pinned exact one", () => {
+		const resolved = resolveConfig(
+			[
+				layer("user", "/u.yml", {
+					rules: [
+						{ id: "pattern", kind: "allow-pattern", tool: "bash", target: "git*", reason: "broad" },
+						{ id: "prefix", kind: "allow-command", tool: "bash", command: ["git", "log"], reason: "floor" },
+					],
+				}),
+			],
+			[],
+			paths,
+		);
+		const byId = new Map(resolved.rules.map(r => [r.id, r]));
+		const prefix = byId.get("prefix");
+		const pattern = byId.get("pattern");
+		expect(prefix?.specificity ?? 0).toBeGreaterThan(pattern?.specificity ?? 0);
 	});
 });
 

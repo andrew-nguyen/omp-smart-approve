@@ -119,16 +119,17 @@ describe("bounded ring", () => {
 		expect(tracker.recent(-1)).toEqual([]);
 	});
 
-	test("clear drops the ring and both latest slots", () => {
+	test("clear drops the ring, the intent, and every rationale slot", () => {
 		const tracker = createProvenanceTracker({ redactor: inert });
 		tracker.recordUserMessage("hi");
 		tracker.recordAssistantRationale("ok");
+		tracker.observeInFlightRationale({ text: "streaming", fromReasoning: false });
 		tracker.recordToolResult({ toolName: "read", isError: false, summary: "x", at: 1 });
 
 		tracker.clear();
 		expect(tracker.recent(10)).toEqual([]);
 		expect(tracker.latestUserIntent()).toBe("");
-		expect(tracker.latestAssistantRationale()).toBe("");
+		expect(tracker.rationaleView()).toEqual({ text: "", freshness: "none", fromReasoning: false });
 	});
 });
 
@@ -178,8 +179,8 @@ describe("user intent and assistant rationale", () => {
 		tracker.recordAssistantRationale("second rationale");
 
 		expect(tracker.latestUserIntent()).toBe("second request");
-		expect(tracker.latestAssistantRationale()).toBe("second rationale");
-		expect(tracker.latestUserIntent()).not.toBe(tracker.latestAssistantRationale());
+		expect(tracker.rationaleView().text).toBe("second rationale");
+		expect(tracker.latestUserIntent()).not.toBe(tracker.rationaleView().text);
 	});
 
 	test("are capped at 2000 characters", () => {
@@ -188,7 +189,7 @@ describe("user intent and assistant rationale", () => {
 		tracker.recordAssistantRationale("a".repeat(5000));
 
 		expect(tracker.latestUserIntent()).toHaveLength(2000);
-		expect(tracker.latestAssistantRationale()).toHaveLength(2000);
+		expect(tracker.rationaleView().text).toHaveLength(2000);
 	});
 
 	test("keep their line structure, unlike the one-line trace summaries", () => {
@@ -205,11 +206,114 @@ describe("user intent and assistant rationale", () => {
 		tracker.recordAssistantRationale(`deploying with ${SECRET_VALUE}`);
 
 		expect(tracker.latestUserIntent()).not.toContain(SECRET_VALUE);
-		expect(tracker.latestAssistantRationale()).not.toContain(SECRET_VALUE);
+		expect(tracker.rationaleView().text).not.toContain(SECRET_VALUE);
 	});
 
 	test("the tracker exposes no way to record a judge verdict or judge prompt", () => {
 		const tracker = createProvenanceTracker({ redactor: inert });
 		expect(Object.keys(tracker).filter(key => /judge|verdict|history/i.test(key))).toEqual([]);
+	});
+});
+
+/**
+ * The host fires `tool_call` before it publishes the assistant message, so the
+ * completed-turn slot is always at least one message behind the calls being
+ * judged. The in-flight buffer is what closes that gap, and the freshness label
+ * is what keeps the judge from being told a stale statement is a live one.
+ */
+describe("rationale freshness", () => {
+	test("reports none until anything has been said", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+
+		expect(tracker.rationaleView()).toEqual({ text: "", freshness: "none", fromReasoning: false });
+	});
+
+	test("a completed turn is labeled as possibly predating the call", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.recordAssistantRationale("checked the branch");
+
+		expect(tracker.rationaleView()).toEqual({
+			text: "checked the branch",
+			freshness: "previous-turn",
+			fromReasoning: false,
+		});
+	});
+
+	test("the streaming turn supersedes the completed one", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.recordAssistantRationale("what I said last turn");
+		tracker.observeInFlightRationale({ text: "auditing the staged files now", fromReasoning: false });
+
+		expect(tracker.rationaleView()).toEqual({
+			text: "auditing the staged files now",
+			freshness: "current-turn",
+			fromReasoning: false,
+		});
+	});
+
+	test("clearing the buffer falls back to the completed turn, not to nothing", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.recordAssistantRationale("what I said last turn");
+		tracker.observeInFlightRationale({ text: "streaming text", fromReasoning: false });
+		tracker.observeInFlightRationale(undefined);
+
+		expect(tracker.rationaleView().freshness).toBe("previous-turn");
+		expect(tracker.rationaleView().text).toBe("what I said last turn");
+	});
+
+	test("streaming deltas grow; a re-delivered earlier snapshot cannot shrink the buffer", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.observeInFlightRationale({ text: "I'll audit", fromReasoning: false });
+		tracker.observeInFlightRationale({ text: "I'll audit the staged files", fromReasoning: false });
+		tracker.observeInFlightRationale({ text: "I'll audit", fromReasoning: false });
+
+		expect(tracker.rationaleView().text).toBe("I'll audit the staged files");
+	});
+
+	test("stated prose replaces reasoning text, and never the reverse", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.observeInFlightRationale({ text: "thinking at some length about it", fromReasoning: true });
+		tracker.observeInFlightRationale({ text: "auditing now", fromReasoning: false });
+		expect(tracker.rationaleView()).toEqual({
+			text: "auditing now",
+			freshness: "current-turn",
+			fromReasoning: false,
+		});
+
+		tracker.observeInFlightRationale({ text: "more reasoning, much longer than the prose", fromReasoning: true });
+		expect(tracker.rationaleView().text).toBe("auditing now");
+	});
+
+	test("a reasoning-derived rationale is flagged through both slots", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.observeInFlightRationale({ text: "weighing whether to read the file", fromReasoning: true });
+		expect(tracker.rationaleView().fromReasoning).toBe(true);
+
+		tracker.observeInFlightRationale(undefined);
+		tracker.recordAssistantRationale("weighing whether to read the file", { fromReasoning: true });
+		expect(tracker.rationaleView()).toEqual({
+			text: "weighing whether to read the file",
+			freshness: "previous-turn",
+			fromReasoning: true,
+		});
+	});
+
+	test("an empty observation is ignored rather than treated as a retraction", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.observeInFlightRationale({ text: "auditing now", fromReasoning: false });
+		tracker.observeInFlightRationale({ text: "", fromReasoning: false });
+
+		expect(tracker.rationaleView().text).toBe("auditing now");
+	});
+
+	test("in-flight text is redacted, bounded, and kept out of the trace", () => {
+		const tracker = createProvenanceTracker({ redactor: guarded });
+		tracker.observeInFlightRationale({ text: `pushing with ${SECRET_VALUE} `.repeat(400), fromReasoning: false });
+
+		const view = tracker.rationaleView();
+		expect(view.text).not.toContain(SECRET_VALUE);
+		expect(view.text).toHaveLength(2000);
+		// The buffer is a live view of one turn, not session history.
+		expect(tracker.recent(50)).toEqual([]);
 	});
 });

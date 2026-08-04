@@ -309,6 +309,8 @@ describe("judge input assembly", () => {
 				"operation",
 				"policyDocuments",
 				"postureHints",
+				"rationaleFreshness",
+				"rationaleFromReasoning",
 				"recentActions",
 				"sensitivity",
 				"sourceAgentId",
@@ -328,13 +330,39 @@ describe("judge input assembly", () => {
 		expect(input.agentRationale).not.toBe(input.userIntent);
 	});
 
-	test("fences the argument view and the agent rationale as inert evidence", () => {
+	test("carries the rationale unfenced so the prompt can render a real placeholder", () => {
+		// Pre-fencing here is what made `(no stated rationale)` unreachable: an empty
+		// rationale reached the judge as an empty evidence block, which it read as a
+		// claim about the agent rather than as a gap in the evidence.
+		const withRationale = buildJudgeInput(optionsFor(trackerWith(), { content: "x" }));
+		const silent = buildJudgeInput(optionsFor(createProvenanceTracker({ redactor: inert }), { content: "x" }));
+
+		expect(withRationale.agentRationale).toBe("appending one line to CHANGELOG.md");
+		expect(withRationale.agentRationale).not.toContain(EVIDENCE_OPEN);
+		expect(silent.agentRationale).toBe("");
+	});
+
+	test("labels the rationale's freshness and whether it came from reasoning", () => {
+		const completed = buildJudgeInput(optionsFor(trackerWith(), { content: "x" }));
+		expect(completed.rationaleFreshness).toBe("previous-turn");
+		expect(completed.rationaleFromReasoning).toBe(false);
+
+		const streaming = trackerWith();
+		streaming.observeInFlightRationale({ text: "checking the staged files", fromReasoning: true });
+		const live = buildJudgeInput(optionsFor(streaming, { content: "x" }));
+		expect(live.agentRationale).toBe("checking the staged files");
+		expect(live.rationaleFreshness).toBe("current-turn");
+		expect(live.rationaleFromReasoning).toBe(true);
+
+		const silent = buildJudgeInput(optionsFor(createProvenanceTracker({ redactor: inert }), { content: "x" }));
+		expect(silent.rationaleFreshness).toBe("none");
+	});
+
+	test("fences the argument view as inert evidence and leaves intent unfenced", () => {
 		const input = buildJudgeInput(optionsFor(trackerWith(), { content: "x" }));
 
 		expect(input.argumentsView.startsWith(EVIDENCE_OPEN)).toBe(true);
 		expect(input.argumentsView.endsWith(EVIDENCE_CLOSE)).toBe(true);
-		expect(input.agentRationale.startsWith(EVIDENCE_OPEN)).toBe(true);
-		expect(input.agentRationale.endsWith(EVIDENCE_CLOSE)).toBe(true);
 		// The user is the authority the judge measures against, not quoted evidence.
 		expect(input.userIntent).not.toContain(EVIDENCE_OPEN);
 	});

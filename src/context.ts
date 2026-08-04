@@ -28,7 +28,14 @@ import {
 	type SecretEntry,
 } from "@oh-my-pi/pi-coding-agent/secrets";
 import { obfuscateToolArguments, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
-import type { CallTarget, JudgeInput, ProvenanceEntry, ProvenanceSource, SensitivityLevel } from "./contracts.ts";
+import type {
+	CallTarget,
+	JudgeInput,
+	ProvenanceEntry,
+	ProvenanceSource,
+	RationaleFreshness,
+	SensitivityLevel,
+} from "./contracts.ts";
 
 // ---------------------------------------------------------------------------
 // Inert-data delimiters
@@ -286,12 +293,28 @@ function oneLine(text: string, limit: number): string {
 	return clampText(text.replace(/\s+/g, " ").trim(), limit);
 }
 
+/** The rationale the judge should be shown, with an honest freshness label. */
+export interface RationaleView {
+	text: string;
+	freshness: RationaleFreshness;
+	fromReasoning: boolean;
+}
+
 export interface ProvenanceTracker {
 	recordUserMessage(text: string): void;
-	recordAssistantRationale(text: string): void;
+	recordAssistantRationale(text: string, options?: { fromReasoning?: boolean }): void;
+	/**
+	 * Take the assistant turn that is still streaming.
+	 *
+	 * `undefined` clears the buffer. Otherwise the buffer keeps whichever text is
+	 * more informative: streaming deltas only ever grow, so a shorter arrival is a
+	 * re-delivered earlier snapshot rather than a retraction, and stated prose
+	 * supersedes reasoning text but never the reverse.
+	 */
+	observeInFlightRationale(input: { text: string; fromReasoning: boolean } | undefined): void;
+	rationaleView(): RationaleView;
 	recordToolResult(input: { toolName: string; isError: boolean; summary: string; at: number }): void;
 	latestUserIntent(): string;
-	latestAssistantRationale(): string;
 	recent(limit: number): ProvenanceEntry[];
 	clear(): void;
 }
@@ -307,16 +330,27 @@ export function createProvenanceTracker(options: { redactor: Redactor; ringSize?
 	const ringSize = Math.max(1, options.ringSize ?? DEFAULT_RING_SIZE);
 	const ring: ProvenanceEntry[] = [];
 	let userIntent = "";
-	let agentRationale = "";
+	let completedRationale: { text: string; fromReasoning: boolean } = { text: "", fromReasoning: false };
+	/**
+	 * The turn currently streaming, held raw. Sanitizing here would redo the same
+	 * secret scan on every token delta; the buffer is read once per judged call,
+	 * so the work belongs there. It never enters the ring and is never persisted.
+	 */
+	let inFlightRationale: { text: string; fromReasoning: boolean } | undefined;
 
 	function push(entry: ProvenanceEntry): void {
 		ring.push(entry);
 		if (ring.length > ringSize) ring.splice(0, ring.length - ringSize);
 	}
 
+	/** Redact, de-identify, and bound one message before anything else may read it. */
+	function sanitize(text: string): string {
+		return clampText(minimizeText(redactor.redactText(text)), MESSAGE_CHAR_LIMIT);
+	}
+
 	return {
 		recordUserMessage(text) {
-			userIntent = clampText(minimizeText(redactor.redactText(text)), MESSAGE_CHAR_LIMIT);
+			userIntent = sanitize(text);
 			push({
 				source: "user",
 				toolName: "user",
@@ -326,15 +360,49 @@ export function createProvenanceTracker(options: { redactor: Redactor; ringSize?
 			});
 		},
 
-		recordAssistantRationale(text) {
-			agentRationale = clampText(minimizeText(redactor.redactText(text)), MESSAGE_CHAR_LIMIT);
+		recordAssistantRationale(text, options) {
+			completedRationale = { text: sanitize(text), fromReasoning: options?.fromReasoning === true };
 			push({
 				source: "assistant",
 				toolName: "assistant",
-				summary: oneLine(agentRationale, SUMMARY_CHAR_LIMIT),
+				summary: oneLine(completedRationale.text, SUMMARY_CHAR_LIMIT),
 				at: Date.now(),
 				untrusted: false,
 			});
+		},
+
+		observeInFlightRationale(input) {
+			if (input === undefined) {
+				inFlightRationale = undefined;
+				return;
+			}
+			if (input.text.length === 0) return;
+			const buffered = inFlightRationale;
+			if (buffered === undefined || (buffered.fromReasoning && !input.fromReasoning)) {
+				inFlightRationale = input;
+				return;
+			}
+			if (buffered.fromReasoning !== input.fromReasoning) return;
+			if (input.text.length > buffered.text.length) inFlightRationale = input;
+		},
+
+		rationaleView() {
+			const streaming = inFlightRationale;
+			if (streaming !== undefined) {
+				return {
+					text: sanitize(streaming.text),
+					freshness: "current-turn",
+					fromReasoning: streaming.fromReasoning,
+				};
+			}
+			if (completedRationale.text.length > 0) {
+				return {
+					text: completedRationale.text,
+					freshness: "previous-turn",
+					fromReasoning: completedRationale.fromReasoning,
+				};
+			}
+			return { text: "", freshness: "none", fromReasoning: false };
 		},
 
 		recordToolResult(input) {
@@ -354,10 +422,6 @@ export function createProvenanceTracker(options: { redactor: Redactor; ringSize?
 			return userIntent;
 		},
 
-		latestAssistantRationale() {
-			return agentRationale;
-		},
-
 		recent(limit) {
 			if (limit <= 0) return [];
 			return ring.slice(Math.max(0, ring.length - limit));
@@ -366,7 +430,8 @@ export function createProvenanceTracker(options: { redactor: Redactor; ringSize?
 		clear() {
 			ring.length = 0;
 			userIntent = "";
-			agentRationale = "";
+			completedRationale = { text: "", fromReasoning: false };
+			inFlightRationale = undefined;
 		},
 	};
 }
@@ -535,11 +600,17 @@ export interface BuildJudgeInputOptions {
  */
 export function buildJudgeInput(input: BuildJudgeInputOptions): JudgeInput {
 	const view = buildArgumentsView(input.rawArguments, input.threshold, input.redactor);
+	const rationale = input.tracker.rationaleView();
 	return {
 		// The user is the authority the judge measures the call against, so intent is
 		// not fenced as untrusted evidence — only defanged against fence forgery.
 		userIntent: neutralizeEvidenceMarkers(input.tracker.latestUserIntent()),
-		agentRationale: wrapEvidence(input.tracker.latestAssistantRationale()),
+		// Handed over unfenced. Wrapping it here made the empty-rationale placeholder
+		// in `buildJudgeMessages` unreachable, so a turn that stated nothing reached
+		// the judge as an empty evidence block — which it read as a claim.
+		agentRationale: rationale.text,
+		rationaleFreshness: rationale.freshness,
+		rationaleFromReasoning: rationale.fromReasoning,
 		toolName: input.toolName,
 		operation: input.operation,
 		argumentsView: wrapEvidence(view.text),

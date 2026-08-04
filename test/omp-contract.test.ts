@@ -152,6 +152,8 @@ describe("extension loading", () => {
 		for (const event of [
 			"session_start",
 			"before_agent_start",
+			"message_start",
+			"message_update",
 			"message_end",
 			"tool_call",
 			"tool_execution_start",

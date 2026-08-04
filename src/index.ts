@@ -372,6 +372,7 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 
 				const redactor = dependencies.redactor ?? (await loadSessionRedactor(ctx.cwd, agentDir));
 				const tracker = createProvenanceTracker({ redactor });
+				seedUserIntent(tracker, ctx.sessionManager);
 
 				const gate = buildGate(ctx, resolved, store, redactor, tracker);
 
@@ -437,17 +438,54 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 
 		// ------------------------------------------------------------- provenance
 
+		/**
+		 * The current turn's narration, captured while it streams.
+		 *
+		 * The host prepares tool dispatch — and so fires `tool_call` — before it
+		 * publishes the finished assistant message, so `message_end` always arrives
+		 * too late to explain the calls that message makes. Reading the partials is
+		 * the only way the judge sees why *this* call is happening instead of what
+		 * the agent said a message ago.
+		 */
+		const streamingRationale = (event: unknown, take: "clear" | "buffer"): void => {
+			if (!runtime) return;
+			try {
+				const message: unknown = (event as { message?: unknown }).message;
+				if (typeof message !== "object" || message === null) return;
+				if (!("role" in message) || message.role !== "assistant") return;
+				runtime.tracker.observeInFlightRationale(take === "clear" ? undefined : extractRationaleText(message));
+			} catch {
+				// See `message_end`: provenance is best-effort.
+			}
+		};
+
+		// A new turn starts with nothing said yet; the last turn's words must not
+		// stand in for it.
+		api.on("message_start", event => streamingRationale(event, "clear"));
+		api.on("message_update", event => streamingRationale(event, "buffer"));
+
 		api.on("message_end", (event, _ctx) => {
 			if (!runtime) return;
 			try {
 				const message: unknown = (event as { message?: unknown }).message;
 				if (typeof message !== "object" || message === null) return;
-				if (!("role" in message)) return;
-				const role = message.role;
-				const text = extractText(message);
-				if (text.length === 0) return;
-				if (role === "user") runtime.tracker.recordUserMessage(text);
-				else if (role === "assistant") runtime.tracker.recordAssistantRationale(text);
+				const source = classifyIntentSource(message);
+				if (source.kind === "ignore") return;
+				if (source.kind === "user-intent") {
+					// Empty means "nothing capturable here", not "the user asked for
+					// nothing". Recording it would erase the authority the judge
+					// measures every later call against.
+					if (source.text.length > 0) runtime.tracker.recordUserMessage(source.text);
+					return;
+				}
+				const rationale = extractRationaleText(message);
+				// The turn is over: its text is now history, not the live account of a
+				// call in flight.
+				runtime.tracker.observeInFlightRationale(undefined);
+				if (rationale.text.length === 0) return;
+				runtime.tracker.recordAssistantRationale(rationale.text, {
+					fromReasoning: rationale.fromReasoning,
+				});
 			} catch {
 				// Provenance is best-effort context. Losing an entry degrades the judge's
 				// evidence, which the gate already treats conservatively.
@@ -698,6 +736,180 @@ function extractText(value: object): string {
 		}
 	}
 	return "";
+}
+
+/**
+ * The account this assistant turn gives of itself.
+ *
+ * Prose first. A turn that thought and then called a tool without narrating has
+ * no prose at all, and reading that as "no rationale" is what left the judge
+ * quoting a sentence from two messages earlier as if it were live justification.
+ * The reasoning text is then the only account of this turn that exists, so it is
+ * used — and flagged, so the judge is never told the agent said something it did
+ * not say out loud.
+ */
+function extractRationaleText(message: object): { text: string; fromReasoning: boolean } {
+	const prose = extractText(message);
+	if (prose.length > 0) return { text: prose, fromReasoning: false };
+	return { text: extractThinking(message), fromReasoning: true };
+}
+
+/** Reasoning blocks carry `thinking`, not `text`, so {@link extractText} skips them. */
+function extractThinking(message: object): string {
+	if (!("content" in message) || !Array.isArray(message.content)) return "";
+	return message.content
+		.map(block =>
+			typeof block === "object" && block !== null && "thinking" in block && typeof block.thinking === "string"
+				? block.thinking
+				: "",
+		)
+		.filter(text => text.length > 0)
+		.join("\n");
+}
+
+/**
+ * Host constants, duplicated rather than imported: `SKILL_PROMPT_MESSAGE_TYPE`
+ * lives in `@oh-my-pi/pi-coding-agent/session/messages`, whose import pulls the
+ * native addon bundle in at runtime. Both values are part of the persisted
+ * session format, so they are as stable as the entry schema itself.
+ */
+const SKILL_PROMPT_CUSTOM_TYPE = "skill-prompt";
+const COLLAB_PROMPT_CUSTOM_TYPE = "collab-prompt";
+
+/**
+ * The only custom types whose content or details a human authored.
+ *
+ * An allowlist, because `attribution: "user"` alone does not mean the user wrote
+ * it: the host stamps the same attribution on the `ultrathink-notice`,
+ * `orchestrate-notice`, and `workflow-notice` boilerplate it appends *after* a
+ * user turn, and on the model-generated `image-attachment-description`. Any of
+ * those would overwrite the real request — one with harness prose, one with
+ * model output wearing user authority.
+ *
+ * These two are exactly the custom types the host itself converts into a
+ * `role: "user"` message for the model (`isUserInvokedSkillPrompt`,
+ * `isSteeringUserMessage` in `session/messages.ts`).
+ */
+const USER_AUTHORED_CUSTOM_TYPES: Record<string, true> = {
+	[SKILL_PROMPT_CUSTOM_TYPE]: true,
+	[COLLAB_PROMPT_CUSTOM_TYPE]: true,
+};
+
+/** Which authority channel a completed message may feed. */
+type IntentSource = { kind: "user-intent"; text: string } | { kind: "assistant" } | { kind: "ignore" };
+
+/**
+ * Classify a message into the channel it speaks for.
+ *
+ * This is a trust boundary, not bookkeeping. USER INTENT is the only authority
+ * the judge measures a call against, so a message reaches it only when the human
+ * actually authored it — role alone is not enough, and neither is arriving in a
+ * user-shaped envelope the agent or the harness produced.
+ */
+function classifyIntentSource(message: object): IntentSource {
+	if (!("role" in message)) return { kind: "ignore" };
+	switch (message.role) {
+		case "assistant":
+			return { kind: "assistant" };
+		case "user":
+			// Auto-continue and agent-issued prompts wear the user role without being
+			// the user. A steering message is typed by the human mid-turn, so it
+			// carries their authority and is deliberately not filtered out.
+			if ("synthetic" in message && message.synthetic === true) return { kind: "ignore" };
+			if ("attribution" in message && message.attribution === "agent") return { kind: "ignore" };
+			return { kind: "user-intent", text: extractText(message) };
+		case "custom": {
+			// Skill and collab prompts reach the model as user messages; every other
+			// custom type is harness or model text, whatever it is attributed to.
+			if (!("attribution" in message) || message.attribution !== "user") return { kind: "ignore" };
+			const customType = "customType" in message ? message.customType : undefined;
+			if (typeof customType !== "string" || USER_AUTHORED_CUSTOM_TYPES[customType] !== true) {
+				return { kind: "ignore" };
+			}
+			return {
+				kind: "user-intent",
+				text: customType === SKILL_PROMPT_CUSTOM_TYPE ? describeSkillInvocation(message) : extractText(message),
+			};
+		}
+		default:
+			// `developer`, `toolResult`, and any future role: no user authority.
+			return { kind: "ignore" };
+	}
+}
+
+/**
+ * Recover the last user request from the session already on disk.
+ *
+ * A session resumed mid-task holds the request in its history but not in the
+ * tracker, so without this its first calls are judged as if the user had asked
+ * for nothing — the same starved-authority state that turns a routine call into
+ * an escalation. The branch is root-to-leaf, so it is walked backward: the
+ * latest user-authored entry wins, exactly as live capture would have left it.
+ */
+function seedUserIntent(tracker: ProvenanceTracker, sessionManager: ExtensionContext["sessionManager"]): void {
+	try {
+		const getBranch: unknown = sessionManager.getBranch;
+		if (typeof getBranch !== "function") return;
+		const branch: unknown = getBranch.call(sessionManager);
+		if (!Array.isArray(branch)) return;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const message = messageFromEntry(branch[index]);
+			if (message === undefined) continue;
+			const source = classifyIntentSource(message);
+			if (source.kind !== "user-intent" || source.text.length === 0) continue;
+			tracker.recordUserMessage(source.text);
+			return;
+		}
+	} catch {
+		// Seeding is best-effort, like every other provenance path: a session that
+		// cannot read its own history starts with empty intent, which the judge
+		// already handles conservatively. It must never fail startup, because a
+		// failed startup blocks every scoped call.
+	}
+}
+
+/**
+ * Project a persisted session entry onto the message shape
+ * {@link classifyIntentSource} reads.
+ *
+ * A custom message persists as its own entry type with the fields on the entry
+ * itself, not nested under `message`, so the skill invocation a resumed session
+ * was started from is invisible to a `type === "message"` filter.
+ */
+function messageFromEntry(entry: unknown): object | undefined {
+	if (typeof entry !== "object" || entry === null || !("type" in entry)) return undefined;
+	if (entry.type === "message") {
+		const message: unknown = "message" in entry ? entry.message : undefined;
+		return typeof message === "object" && message !== null ? message : undefined;
+	}
+	if (entry.type !== "custom_message") return undefined;
+	return {
+		role: "custom",
+		...("customType" in entry ? { customType: entry.customType } : {}),
+		...("attribution" in entry ? { attribution: entry.attribution } : {}),
+		...("details" in entry ? { details: entry.details } : {}),
+		...("content" in entry ? { content: entry.content } : {}),
+	};
+}
+
+/**
+ * Describe a skill invocation using only what the human supplied: the skill they
+ * named and the arguments they wrote.
+ *
+ * The message content is deliberately not read. The host renders the whole
+ * SKILL.md body into it, and that body is disk content the agent chose to load —
+ * recording it as user intent would let any skill file on disk authorize the
+ * calls it asks for.
+ */
+function describeSkillInvocation(message: object): string {
+	const details: unknown = "details" in message ? message.details : undefined;
+	if (typeof details !== "object" || details === null) return "";
+	const name = "name" in details && typeof details.name === "string" ? details.name : "";
+	// Without the skill's name nothing trustworthy is left to attribute, so the
+	// channel stays empty and the judge treats authority as unproven.
+	if (name.length === 0) return "";
+	const args = "args" in details && typeof details.args === "string" ? details.args.trim() : "";
+	return args.length === 0 ? `Invoked skill "${name}"` : `Invoked skill "${name}": ${args}`;
 }
 
 export default createSmartApproveExtension();

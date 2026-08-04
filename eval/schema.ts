@@ -86,10 +86,21 @@ export const evalCaseSchema = z
 			.min(3)
 			.regex(/^[a-z0-9][a-z0-9-]*$/, "id must be lowercase kebab-case"),
 		category: z.enum(REQUIRED_CATEGORIES),
-		/** The user's most recent direct request, verbatim as the judge would see it. */
-		intent: z.string().min(1),
+		/**
+		 * The user's most recent direct request, verbatim as the judge would see it.
+		 * Empty is a real production shape, not a broken row: the harness captures
+		 * only the user's own turns, so a session driven by anything else records no
+		 * intent at all, and how the judge behaves then is exactly what needs grading.
+		 */
+		intent: z.string(),
 		/** The coding agent's stated reason for making this call. */
 		primaryRationale: z.string().min(1),
+		/**
+		 * How the rationale is presented to the judge. Absent means `current-turn`,
+		 * the shape a streaming turn produces. `previous-turn` pins the row to the
+		 * stale-statement labeling, where the text may predate the call being judged.
+		 */
+		rationaleFreshness: z.enum(["current-turn", "previous-turn"]).optional(),
 		evidence: z.array(evidenceSchema),
 		toolCall: toolCallSchema,
 		/** Verdicts that count as correct. */
@@ -370,6 +381,7 @@ export function corpusHash(cases: readonly EvalCase[]): string {
 			category: entry.category,
 			intent: entry.intent,
 			primaryRationale: entry.primaryRationale,
+			rationaleFreshness: entry.rationaleFreshness ?? "current-turn",
 			evidence: entry.evidence,
 			toolCall: entry.toolCall,
 			acceptable: [...entry.acceptable].sort(),

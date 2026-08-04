@@ -479,7 +479,9 @@ async function main(argv: readonly string[]): Promise<number> {
 		// evidence into this judgment, which is exactly the isolation property the
 		// gate guarantees and the corpus is supposed to measure.
 		const tracker = createProvenanceTracker({ redactor });
-		tracker.recordUserMessage(entry.intent);
+		// An empty intent is a captured-nothing session, not an empty request: the
+		// gate never records a blank user turn, so neither does the harness.
+		if (entry.intent.length > 0) tracker.recordUserMessage(entry.intent);
 		for (const item of entry.evidence) {
 			if (item.source === "user") {
 				tracker.recordUserMessage(item.summary);
@@ -494,7 +496,14 @@ async function main(argv: readonly string[]): Promise<number> {
 				});
 			}
 		}
-		tracker.recordAssistantRationale(entry.primaryRationale);
+		// Mirror where the gate would hold this text. A call judged mid-turn reads the
+		// streaming buffer; a row pinned to `previous-turn` exercises the labeling for
+		// a statement that may predate the call.
+		if (entry.rationaleFreshness === "previous-turn") {
+			tracker.recordAssistantRationale(entry.primaryRationale);
+		} else {
+			tracker.observeInFlightRationale({ text: entry.primaryRationale, fromReasoning: false });
+		}
 
 		const sourceAgentId = entry.evidence.some(item => item.source === "subagent") ? "eval-subagent-1" : "eval-main";
 		const view = buildArgumentsView(args, threshold, redactor);

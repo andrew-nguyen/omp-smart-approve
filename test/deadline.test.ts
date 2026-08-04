@@ -114,6 +114,8 @@ function gateWith(options: {
 		buildJudgeInput: request => ({
 			userIntent: "u",
 			agentRationale: "a",
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
 			toolName: request.toolName,
 			operation: request.canonicalCall.operation,
 			argumentsView: "{}",
