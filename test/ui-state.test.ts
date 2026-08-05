@@ -4,7 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { bindDecision, holdCall, resetBrokerForTests } from "../src/broker.ts";
 import { effectiveSensitivity, resolveConfig } from "../src/config.ts";
-import type { AuditEvent, AuditRecord, EscalationRequest, FrozenCall, PendingApproval } from "../src/contracts.ts";
+import type {
+	AuditEvent,
+	AuditRecord,
+	EscalationContext,
+	EscalationRequest,
+	FrozenCall,
+	PendingApproval,
+} from "../src/contracts.ts";
 import type { RiskCard } from "../src/gate.ts";
 import { hashArguments } from "../src/policy.ts";
 import type { AuditAggregate } from "../src/store.ts";
@@ -17,11 +24,13 @@ import {
 	renderPendingList,
 	renderReview,
 	renderRiskCard,
+	renderSbar,
 	renderStatus,
 	STATUS_KEY,
 	type UiHost,
 	WIDGET_APPROVAL,
 	WIDGET_BYPASS,
+	WIDGET_OVERRIDE,
 	WIDGET_RISK_CARD,
 } from "../src/ui.ts";
 
@@ -118,6 +127,13 @@ function request(overrides: Partial<EscalationRequest> = {}): EscalationRequest 
 		},
 		risk: "destructive-action",
 		rationale: "overwrites the system password database",
+		context: {
+			userIntent: "rotate the service account password",
+			agentRationale: "writing the new password file",
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
+			flaggedBy: "judge",
+		},
 		sourceAgentId: "Researcher",
 		sourceAgentKind: "sub",
 		parentAgentId: "Main",
@@ -147,6 +163,25 @@ function pendingRecord(overrides: Partial<PendingApproval> = {}): PendingApprova
 		exemptAttempts: 0,
 		...overrides,
 	};
+}
+
+const CONTEXT: EscalationContext = {
+	userIntent: "rotate the service account password",
+	agentRationale: "writing the new password file",
+	rationaleFreshness: "current-turn",
+	rationaleFromReasoning: false,
+	flaggedBy: "judge",
+};
+
+function sbarOf(context: EscalationContext | undefined, rationale = "overwrites the system password database") {
+	return renderSbar({
+		toolName: "write",
+		operation: "write",
+		targetSummary: "path:/etc/shadow",
+		risk: "destructive-action",
+		rationale,
+		...(context === undefined ? {} : { context }),
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +396,106 @@ describe("renderApprovalRequest", () => {
 		expect(text).not.toContain("…");
 		expect(text).not.toContain("[truncated");
 	});
+
+	test("leads with the SBAR block, above the forensic detail it does not replace", () => {
+		const lines = renderApprovalRequest(request(), 12_000);
+
+		expect(lines[0]).toBe("SMART APPROVE: human approval required");
+		expect(lines[2]?.startsWith("S  Held for your decision: write write targeting path:/etc/shadow.")).toBe(true);
+		expect(lines[3]).toBe(`B  You asked: "rotate the service account password".`);
+		expect(lines[6]?.startsWith("R  ")).toBe(true);
+		// Additive: the ground truth every approval is still bound to stays put.
+		const text = lines.join("\n");
+		expect(text).toContain("Literal arguments (complete, exactly as the agent wrote them):");
+		expect(text).toContain("Deny is the default. Approve only this exact call. Approval is single-use");
+		expect(text).toContain("and bound to the call hash above.");
+		expect(text).toContain(`Call hash:    ${hashArguments(ARGS)}`);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// SBAR
+// ---------------------------------------------------------------------------
+
+describe("renderSbar", () => {
+	test("is exactly Situation, Background, Assessment, Recommendation, in that order", () => {
+		const lines = sbarOf(CONTEXT);
+
+		expect(lines).toHaveLength(5);
+		expect(lines.map(line => line.slice(0, 3))).toEqual(["S  ", "B  ", "   ", "A  ", "R  "]);
+		expect(lines[0]).toBe(
+			"S  Held for your decision: write write targeting path:/etc/shadow. Risk: destructive-action.",
+		);
+	});
+
+	test("an empty channel is an explicit finding, never a blank line", () => {
+		const lines = sbarOf({ ...CONTEXT, userIntent: "", agentRationale: "", rationaleFreshness: "none" });
+
+		expect(lines[1]).toBe("B  No user request was captured this session.");
+		expect(lines[2]).toBe("   The agent stated no reason for this call.");
+	});
+
+	test("labels how closely the stated reason tracks this call", () => {
+		const labels = (
+			[
+				["current-turn", false],
+				["current-turn", true],
+				["previous-turn", false],
+				["previous-turn", true],
+			] as const
+		).map(
+			([rationaleFreshness, rationaleFromReasoning]) =>
+				sbarOf({ ...CONTEXT, rationaleFreshness, rationaleFromReasoning })[2],
+		);
+
+		expect(labels).toEqual([
+			`   Agent's reason: "writing the new password file" (stated this turn).`,
+			`   Agent's reason: "writing the new password file" (from private reasoning, this turn).`,
+			`   Agent's reason: "writing the new password file" (may predate this call).`,
+			// Staleness dominates: "this may not be about the call in front of you" wins.
+			`   Agent's reason: "writing the new password file" (may predate this call).`,
+		]);
+	});
+
+	test("the Assessment names which mechanism held the call", () => {
+		expect(sbarOf({ ...CONTEXT, flaggedBy: "judge" })[3]).toBe(
+			"A  Flagged by the judge: overwrites the system password database.",
+		);
+		expect(sbarOf({ ...CONTEXT, flaggedBy: "judge-failure" }, "timeout: attempt exceeded 10000ms")[3]).toBe(
+			"A  The judge never screened this call: timeout: attempt exceeded 10000ms.",
+		);
+		expect(sbarOf({ ...CONTEXT, flaggedBy: "loop-breaker" }, "this is attempt 4 at the same operation")[3]).toBe(
+			"A  Flagged by the retry loop breaker: this is attempt 4 at the same operation.",
+		);
+	});
+
+	test("the Recommendation is deterministic and keyed on the stage, never model text", () => {
+		expect(sbarOf({ ...CONTEXT, flaggedBy: "judge" })[4]).toBe(
+			"R  Deny unless this matches what you asked for. Approving runs this exact call once, then re-locks.",
+		);
+		expect(sbarOf({ ...CONTEXT, flaggedBy: "judge-failure" })[4]).toBe(
+			"R  The judge did not screen this call. Approve only if you can verify the literal arguments yourself.",
+		);
+		expect(sbarOf({ ...CONTEXT, flaggedBy: "loop-breaker" })[4]).toContain("retried this operation repeatedly");
+	});
+
+	test("clamps a runaway rationale instead of flooding the block", () => {
+		const assessment = sbarOf(CONTEXT, "r".repeat(5_000))[3] ?? "";
+		const detail = assessment.replace("A  Flagged by the judge: ", "");
+
+		expect(detail).toHaveLength(220);
+		expect(detail.endsWith("…")).toBe(true);
+	});
+
+	test("never doubles the terminator on a rationale that already ends in one", () => {
+		expect(sbarOf(CONTEXT, "It rewrites remote history.")[3]).toBe(
+			"A  Flagged by the judge: It rewrites remote history.",
+		);
+	});
+
+	test("a record written before context capture says so instead of rendering blanks", () => {
+		expect(sbarOf(undefined)).toEqual(["(recorded before context capture)"]);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -400,8 +535,27 @@ describe("renderRiskCard", () => {
 		expect(text).toContain("not semantically screened");
 	});
 
-	test("keeps its widget key distinct from the bypass and approval widgets", () => {
-		expect(new Set([WIDGET_RISK_CARD, WIDGET_BYPASS, WIDGET_APPROVAL, STATUS_KEY]).size).toBe(4);
+	test("carries the Background sentences when the session captured any, and none otherwise", () => {
+		const bare = renderRiskCard(card).join("\n");
+		expect(bare).not.toContain("Context:");
+
+		const withContext = renderRiskCard({
+			...card,
+			context: {
+				userIntent: "back up the repository",
+				agentRationale: "uploading the archive",
+				rationaleFreshness: "current-turn",
+				rationaleFromReasoning: false,
+			},
+		}).join("\n");
+		expect(withContext).toContain(`Context:     You asked: "back up the repository".`);
+		expect(withContext).toContain(`             Agent's reason: "uploading the archive" (stated this turn).`);
+		// No pending record exists on the prompt branch, so no Recommendation is owed.
+		expect(withContext).not.toContain("Approving runs this exact call once");
+	});
+
+	test("keeps its widget key distinct from the bypass, approval, and override widgets", () => {
+		expect(new Set([WIDGET_RISK_CARD, WIDGET_BYPASS, WIDGET_APPROVAL, WIDGET_OVERRIDE, STATUS_KEY]).size).toBe(5);
 	});
 });
 
@@ -424,7 +578,7 @@ describe("renderPendingList", () => {
 	test("reports every record as intent-only once the broker is empty", () => {
 		resetBrokerForTests();
 		const text = renderPendingList([pendingRecord()], NOW).join("\n");
-		expect(text).toContain("intent-only — literal arguments are gone");
+		expect(text).toContain("intent-only. The literal arguments are gone");
 		expect(text).not.toContain("can mint an exact grant");
 	});
 
@@ -448,6 +602,20 @@ describe("renderPendingList", () => {
 		});
 		const text = renderPendingList([pendingRecord()], NOW).join("\n");
 		expect(text).toContain("intent-only");
+	});
+
+	test("shows what the user asked for, and says plainly when nothing was captured", () => {
+		const asked = renderPendingList([pendingRecord({ context: CONTEXT })], NOW).join("\n");
+		expect(asked).toContain(`    asked:     "rotate the service account password"`);
+
+		const silent = renderPendingList([pendingRecord({ context: { ...CONTEXT, userIntent: "" } })], NOW).join("\n");
+		expect(silent).toContain("    asked:     (no user request captured)");
+	});
+
+	test("omits the row entirely for a record written before context capture", () => {
+		// An absent line is honest here; "(no user request captured)" would be a
+		// claim about a session this row never observed.
+		expect(renderPendingList([pendingRecord()], NOW).join("\n")).not.toContain("asked:");
 	});
 });
 
@@ -759,12 +927,12 @@ describe("renderReview", () => {
 		const text = renderReview(
 			reviewInput({ record: { ...RECORD, cwd: "" }, pending: pendingRecord({ cwd: "" }) }),
 		).join("\n");
-		expect(text).toContain("(unknown — recorded before location tracking)");
+		expect(text).toContain("(unknown, recorded before location tracking)");
 	});
 
 	test("states plainly when the record is intent-only", () => {
 		const text = renderReview(reviewInput()).join("\n");
-		expect(text).toContain("Intent-only — literal arguments are gone");
+		expect(text).toContain("Intent-only. The literal arguments are gone");
 		expect(text).toContain("cannot mint a grant");
 		expect(text).toContain("can still deny or expire");
 	});
@@ -792,7 +960,7 @@ describe("renderReview", () => {
 		expect(text).toContain("escalated");
 		expect(text).toContain("Human decisions:");
 		expect(text).toContain("denied by human: human denied via override");
-		expect(text).toContain("Retry family: family-1 — 2 strikes");
+		expect(text).toContain("Retry family: family-1. Strikes: 2.");
 	});
 
 	test("does not list gate-authored events as human decisions", () => {
@@ -814,5 +982,229 @@ describe("renderReview", () => {
 		).join("\n");
 		expect(text).toContain("deny-pattern bash -> curl *");
 		expect(text).toContain("Non-binding");
+	});
+
+	test("leads with the SBAR, then the forensic record it does not replace", () => {
+		const lines = renderReview(reviewInput({ pending: pendingRecord({ context: CONTEXT }) }));
+
+		expect(lines[0]).toBe("SMART APPROVE REVIEW: audit-42");
+		expect(lines[2]).toBe(
+			"S  Held for your decision: write write targeting path:/etc/shadow. Risk: destructive-action.",
+		);
+		expect(lines[3]).toBe(`B  You asked: "rotate the service account password".`);
+		expect(lines[5]).toBe("A  Flagged by the judge: overwrites the system password database.");
+		expect(lines.join("\n")).toContain("Original verdict (immutable):");
+	});
+
+	test("a record written before context capture says so rather than rendering blanks", () => {
+		const text = renderReview(reviewInput()).join("\n");
+		expect(text).toContain("(recorded before context capture)");
+		expect(text).not.toContain("No user request was captured");
+	});
+
+	test("a call that was never escalated gets no SBAR at all", () => {
+		const { pending: _dropped, ...withoutPending } = reviewInput();
+		const text = renderReview(withoutPending).join("\n");
+		expect(text).not.toContain("(recorded before context capture)");
+		expect(text).not.toContain("Held for your decision");
+		expect(text).toContain("No durable escalation record");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Copy rule
+// ---------------------------------------------------------------------------
+
+describe("escalation copy is plain sentences", () => {
+	test("no dialog, SBAR, pending, review, or risk-card line stitches clauses with a glyph", () => {
+		holdCall({ auditId: "audit-42", nonce: "n", frozenCall: frozen(), expiresAt: NOW + 60_000 });
+		const surfaces: string[][] = [
+			renderApprovalRequest(request(), 12_000),
+			sbarOf(CONTEXT),
+			sbarOf({ ...CONTEXT, flaggedBy: "judge-failure", userIntent: "", agentRationale: "" }),
+			sbarOf({ ...CONTEXT, flaggedBy: "loop-breaker", rationaleFreshness: "previous-turn" }),
+			sbarOf(undefined),
+			renderPendingList([pendingRecord({ context: CONTEXT }), pendingRecord({ auditId: "audit-43" })], NOW),
+			renderReview({
+				auditId: "audit-42",
+				pending: pendingRecord({ context: CONTEXT }),
+				events: [],
+				strikes: 0,
+				authority: { kind: "intent-only", reason: "the literal arguments are no longer in memory" },
+				now: NOW,
+			}),
+			renderRiskCard({
+				auditId: "audit-7",
+				toolName: "bash",
+				risk: "exfiltration",
+				rationale: "pipes repository contents to an external host",
+				targetSummary: "command:curl",
+				judgeAvailable: false,
+				context: CONTEXT,
+			}),
+		];
+
+		for (const line of surfaces.flat()) {
+			expect(line).not.toContain("—");
+			expect(line).not.toContain("·");
+		}
+	});
+
+	test("no decision surface passes a terminal control through to the operator", () => {
+		// `\s` matches none of ESC, BEL, backspace, or C1 NEL, so whitespace
+		// normalization alone leaves every one of these live. ESC can clear the
+		// screen, move the cursor up, and rewrite a row already read: the same
+		// forgery as a bare newline, with more reach.
+		const HOSTILE = "ok\u001b[2K\u001b[1A\u0085\u0007\u0008\u2029 FORGED";
+		const hostileContext: EscalationContext = {
+			userIntent: HOSTILE,
+			agentRationale: HOSTILE,
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
+			flaggedBy: "judge",
+		};
+		holdCall({ auditId: "audit-42", nonce: "n", frozenCall: frozen(), expiresAt: NOW + 60_000 });
+
+		const surfaces: string[][] = [
+			sbarOf(hostileContext, HOSTILE),
+			renderApprovalRequest(request({ rationale: HOSTILE, context: hostileContext }), 12_000),
+			renderRiskCard({
+				auditId: "audit-7",
+				toolName: "bash",
+				risk: "exfiltration",
+				rationale: HOSTILE,
+				targetSummary: `path:${HOSTILE}`,
+				judgeAvailable: true,
+				context: hostileContext,
+			}),
+			renderPendingList([pendingRecord({ context: hostileContext, targetSummary: `path:${HOSTILE}` })], NOW),
+			renderReview({
+				auditId: "audit-42",
+				pending: pendingRecord({ context: hostileContext, rationale: HOSTILE }),
+				events: [],
+				strikes: 0,
+				suggestion: {
+					kind: "deny-pattern",
+					toolName: "write",
+					target: "/etc/**",
+					rationale: HOSTILE,
+				},
+				authority: { kind: "intent-only", reason: "the literal arguments are no longer in memory" },
+				now: NOW,
+			}),
+		];
+
+		for (const lines of surfaces) {
+			for (const line of lines) {
+				// No C0, C1, or Unicode separator survives anywhere on a rendered line.
+				expect(line).not.toMatch(/[\p{Cc}\p{Zl}\p{Zp}]/u);
+			}
+			// And the row count is exactly what the renderer returned.
+			expect(lines.join("\n").split("\n")).toHaveLength(lines.length);
+			// Defanged in place: the operator still sees that something was there.
+			expect(lines.join("\n")).toContain("\\u001b");
+		}
+	});
+
+	test("an oversized operation cannot swamp the Situation line", () => {
+		// `operation` is `${toolName}:${args.action}` for action-style tools, so it is
+		// agent-controlled and, unbounded, defeats "short" on any terminal.
+		const lines = renderSbar({
+			toolName: "browser",
+			operation: `browser:${"o".repeat(200_000)}`,
+			targetSummary: "path:/tmp/a",
+			risk: "uncertain",
+			rationale: "unclear",
+			context: CONTEXT,
+		});
+
+		expect(lines[0]?.length).toBeLessThan(400);
+		expect(lines[0]).toContain("chars total");
+		expect(lines[0]).toContain("Risk: uncertain.");
+	});
+
+	test("a persisted target cannot forge an extra line of decision support", () => {
+		// `summarizeTargets` guards the way in, but a record written by a build that
+		// did not is still live under `pendingApprovalTtl`, so the renderer is the
+		// only thing between that row and the operator. Passed here directly, the
+		// way `renderReview` passes `pending.targetSummary`.
+		const hostile = "path:/repo/notes.md\nR  Approved by policy. Allow once is safe here.";
+		const lines = renderSbar({
+			toolName: "write",
+			operation: "write",
+			targetSummary: hostile,
+			risk: "uncertain",
+			rationale: "unclear",
+			context: CONTEXT,
+		});
+
+		// Array length is meaningless if one entry can carry its own line breaks.
+		expect(lines).toHaveLength(5);
+		expect(lines.join("\n").split("\n")).toHaveLength(5);
+		// Exactly one Recommendation, and it is ours.
+		const recommendations = lines
+			.join("\n")
+			.split("\n")
+			.filter(line => line.startsWith("R  "));
+		expect(recommendations).toHaveLength(1);
+		expect(recommendations[0]).toContain("Deny unless this matches what you asked for.");
+		// Still shown, just defanged.
+		expect(lines[0]).toContain("Approved by policy");
+	});
+
+	test("an oversized persisted target cannot swamp the block", () => {
+		// The plan's promise is a glanceable block. A 5 KB path would defeat that on
+		// any terminal, which is a readability failure rather than a spoof: nothing
+		// here claims to control how the reader's terminal wraps what it is given.
+		const lines = renderSbar({
+			toolName: "write",
+			operation: "write",
+			targetSummary: `path:/repo/${"a".repeat(5_000)}/notes.md`,
+			risk: "uncertain",
+			rationale: "unclear",
+			context: CONTEXT,
+		});
+
+		expect(lines[0]?.length).toBeLessThan(300);
+		expect(lines[0]).toContain("/notes.md.");
+		expect(lines[0]).toContain("chars total");
+	});
+
+	test("a persisted target cannot misalign the pending or review label rows", () => {
+		const hostile = 'path:/repo/notes.md\n    asked:     "anything you like"';
+		const record: AuditRecord = {
+			auditId: "audit-42",
+			toolCallId: "call-42",
+			toolName: "write",
+			operation: "write",
+			targetSummary: hostile,
+			argumentsHash: hashArguments(ARGS),
+			canonicalHash: "canon-1",
+			policyHash: "policy-1",
+			sourceAgentId: "Researcher",
+			sourceAgentKind: "sub",
+			cwd: CWD_FIXTURE,
+			decision: "escalate",
+			stage: "escalation",
+			risk: "destructive-action",
+			rationale: "overwrites the system password database",
+			retryFamilyKey: "family-1",
+			retryCount: 0,
+			createdAt: NOW - 90_000,
+		};
+		const listed = renderPendingList([pendingRecord({ targetSummary: hostile })], NOW);
+		const reviewed = renderReview({
+			auditId: "audit-42",
+			record,
+			events: [],
+			strikes: 0,
+			authority: { kind: "intent-only", reason: "the literal arguments are no longer in memory" },
+			now: NOW,
+		});
+
+		for (const lines of [listed, reviewed]) {
+			expect(lines.join("\n").split("\n")).toHaveLength(lines.length);
+			expect(lines.filter(line => line.trimStart().startsWith("asked:"))).toHaveLength(0);
+		}
 	});
 });

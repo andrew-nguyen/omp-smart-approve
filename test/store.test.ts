@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AuditRecord, Grant, PendingApproval, PolicyRule } from "../src/contracts.ts";
+import type { AuditRecord, EscalationContext, Grant, PendingApproval, PolicyRule } from "../src/contracts.ts";
 import {
 	type AuditBegin,
 	MIGRATIONS,
@@ -148,6 +148,14 @@ function pendingFor(auditId: string, overrides: Partial<PendingApproval> = {}): 
 	return { ...base, ...overrides };
 }
 
+const CONTEXT_FIXTURE: EscalationContext = {
+	userIntent: "clean up the branch history",
+	agentRationale: "force-pushing the rebased branch",
+	rationaleFreshness: "current-turn",
+	rationaleFromReasoning: true,
+	flaggedBy: "judge",
+};
+
 function ruleFor(id: string, overrides: Partial<PolicyRule> = {}): PolicyRule {
 	const base: PolicyRule = {
 		id,
@@ -215,6 +223,33 @@ describe("migration", () => {
 		expect(schemaVersion()).toBe(SCHEMA_VERSION + 1);
 		expect(tableNames()).toContain("probe");
 		expect(upgraded.getAudit("a1")?.decision).toBe("allow");
+	});
+
+	test("a pending row written before context capture upgrades in place and reads as contextless", () => {
+		const legacy = open({ migrations: MIGRATIONS.filter(migration => migration.version <= 2) });
+		legacy.beginAudit(begun("a1"));
+		legacy.close();
+		// Written by that older build: the ctx_* columns do not exist yet.
+		inspect(db =>
+			db.exec(
+				`INSERT INTO pending_approvals (audit_id, tool_name, operation, target_summary, risk, rationale,
+					arguments_hash, canonical_hash, policy_hash, nonce, source_agent_id, state, created_at,
+					expires_at, exempt_attempts, cwd)
+				VALUES ('a1', 'bash', 'exec', 'command:git push', 'destructive-action', 'Pushes to a remote branch.',
+					'args-a1', 'canon-a1', 'policy-1', 'nonce-a1', 'sub-7', 'awaiting-human', ${T0},
+					${T0 + 60_000}, 0, '/repo/project')`,
+			),
+		);
+
+		const upgraded = open();
+
+		expect(schemaVersion()).toBe(SCHEMA_VERSION);
+		expect(upgraded.getPending("a1")?.nonce).toBe("nonce-a1");
+		expect(upgraded.getPending("a1")?.context).toBeUndefined();
+		// And the upgraded database accepts context on the next escalation.
+		upgraded.beginAudit(begun("a2"));
+		upgraded.putPending(pendingFor("a2", { context: CONTEXT_FIXTURE }));
+		expect(upgraded.getPending("a2")?.context).toEqual(CONTEXT_FIXTURE);
 	});
 
 	test("a database newer than the build refuses to open instead of guessing", () => {
@@ -595,6 +630,65 @@ describe("pending approvals", () => {
 
 		expect(store.getPending("a1")?.nonce).toBe("fresh");
 		expect(store.getPending("a1")?.expiresAt).toBe(T0 + 120_000);
+	});
+
+	test("decision support round-trips through both read paths, and its absence stays absent", () => {
+		const store = open();
+		store.beginAudit(begun("with"));
+		store.beginAudit(begun("without"));
+		store.putPending(pendingFor("with", { context: CONTEXT_FIXTURE }));
+		store.putPending(pendingFor("without"));
+
+		expect(store.getPending("with")?.context).toEqual(CONTEXT_FIXTURE);
+		expect(store.getPending("without")?.context).toBeUndefined();
+
+		const listed = store.listOpenPending(T0);
+		expect(listed.find(p => p.auditId === "with")?.context).toEqual(CONTEXT_FIXTURE);
+		expect(listed.find(p => p.auditId === "without")?.context).toBeUndefined();
+	});
+
+	test("an empty intent survives as a finding rather than collapsing into absent context", () => {
+		// An agent acting with nothing captured is itself decision-relevant, so the
+		// empty string must read back as an empty channel, not as a missing record.
+		const store = withAudit(open(), "a1");
+		store.putPending(
+			pendingFor("a1", {
+				context: {
+					userIntent: "",
+					agentRationale: "",
+					rationaleFreshness: "none",
+					rationaleFromReasoning: false,
+					flaggedBy: "loop-breaker",
+				},
+			}),
+		);
+
+		expect(store.getPending("a1")?.context).toEqual({
+			userIntent: "",
+			agentRationale: "",
+			rationaleFreshness: "none",
+			rationaleFromReasoning: false,
+			flaggedBy: "loop-breaker",
+		});
+	});
+
+	test("a row missing the stage hydrates as no context at all, never half filled", () => {
+		const store = withAudit(open(), "a1");
+		store.putPending(pendingFor("a1", { context: CONTEXT_FIXTURE }));
+		inspect(db => db.exec("UPDATE pending_approvals SET ctx_flagged_by = NULL"));
+
+		expect(store.getPending("a1")?.context).toBeUndefined();
+	});
+
+	test("re-escalating an open record refreshes its decision support too", () => {
+		const store = withAudit(open(), "a1");
+		store.putPending(pendingFor("a1", { context: CONTEXT_FIXTURE }));
+		store.putPending(
+			pendingFor("a1", { context: { ...CONTEXT_FIXTURE, flaggedBy: "judge-failure", userIntent: "ship it" } }),
+		);
+
+		expect(store.getPending("a1")?.context?.flaggedBy).toBe("judge-failure");
+		expect(store.getPending("a1")?.context?.userIntent).toBe("ship it");
 	});
 });
 

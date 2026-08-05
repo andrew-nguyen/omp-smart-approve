@@ -1010,6 +1010,27 @@ describe("pending notice on startup", () => {
 		expect(notice).toBeDefined();
 		expect(notice).toContain("/smart-approve pending");
 	});
+
+	test("an async escalation tells the live session in one line", async () => {
+		// Interactive main, no scripted answer: the dialog opens, resolves to
+		// nothing, and the escalation falls through to the asynchronous path.
+		const built = await build({
+			judge: () => ({
+				ok: true,
+				verdict: { decision: "escalate", risk: "destructive-action", rationale: "needs a human" },
+				metrics: { attempts: 1, latencyMs: 5, overTarget: false },
+			}),
+		});
+
+		const result = await toolCall(built, "c1", "write", { path: "a.ts", content: "x" });
+
+		expect(result?.block).toBe(true);
+		const held = built.recorder.notices.filter(notice => notice.startsWith("Smart Approve held a"));
+		expect(held).toHaveLength(1);
+		expect(held[0]).toContain("write call targeting");
+		expect(held[0]).toContain("Risk: destructive-action.");
+		expect(held[0]).toContain("Decide with /smart-approve review ");
+	});
 });
 
 describe("teardown", () => {

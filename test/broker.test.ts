@@ -9,6 +9,7 @@ import {
 	holdCall,
 	humanEndpoint,
 	listEndpoints,
+	notifyHuman,
 	presentToHuman,
 	queueDepth,
 	registerEndpoint,
@@ -42,6 +43,13 @@ function request(overrides: Partial<EscalationRequest> = {}): EscalationRequest 
 		canonicalCall: { toolName: "write", operation: "write", targets: [], argumentsHash: call.argumentsHash },
 		risk: "uncertain",
 		rationale: "needs a human",
+		context: {
+			userIntent: "clean up the branch history",
+			agentRationale: "force-pushing the rebased branch",
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
+			flaggedBy: "judge",
+		},
 		sourceAgentId: "Main",
 		sourceAgentKind: "main",
 		expiresAt: NOW + 20_000,
@@ -109,6 +117,53 @@ describe("main election", () => {
 		expect(hasHumanChannel()).toBe(true);
 		unregisterEndpoint("Main");
 		expect(hasHumanChannel()).toBe(false);
+	});
+});
+
+describe("out-of-band notification", () => {
+	test("reaches the interactive main session", () => {
+		const heard: string[] = [];
+		registerEndpoint(endpoint({ notifyPending: line => heard.push(line) }));
+
+		expect(notifyHuman("Smart Approve held a bash call.")).toBe(true);
+		expect(heard).toEqual(["Smart Approve held a bash call."]);
+	});
+
+	test("a subagent escalation reaches the main session, not the subagent", () => {
+		const sub: string[] = [];
+		const main: string[] = [];
+		registerEndpoint(endpoint({ agentId: "Sub1", agentKind: "sub", notifyPending: line => sub.push(line) }));
+		registerEndpoint(endpoint({ agentId: "Main", notifyPending: line => main.push(line) }));
+
+		expect(notifyHuman("held")).toBe(true);
+		expect(main).toEqual(["held"]);
+		expect(sub).toEqual([]);
+	});
+
+	test("no-ops with no human channel and with a headless main", () => {
+		expect(notifyHuman("held")).toBe(false);
+
+		const heard: string[] = [];
+		registerEndpoint(endpoint({ capability: "headless", notifyPending: line => heard.push(line) }));
+		expect(notifyHuman("held")).toBe(false);
+		expect(heard).toEqual([]);
+	});
+
+	test("an endpoint with no notify channel reports that nobody heard", () => {
+		registerEndpoint(endpoint());
+		expect(notifyHuman("held")).toBe(false);
+	});
+
+	test("a throwing notify is swallowed, because a status line cannot change a verdict", () => {
+		registerEndpoint(
+			endpoint({
+				notifyPending: () => {
+					throw new Error("the TUI is gone");
+				},
+			}),
+		);
+
+		expect(notifyHuman("held")).toBe(false);
 	});
 });
 

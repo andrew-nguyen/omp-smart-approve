@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AuditRecord, Grant, PendingApproval } from "../src/contracts.ts";
+import type { AuditRecord, EscalationContext, Grant, PendingApproval } from "../src/contracts.ts";
 import { guardWrite, openStore, type SmartApproveStore, StoreRedactionError } from "../src/store.ts";
 
 /** Working directory every fixture in this file is bound to. */
@@ -143,6 +143,67 @@ describe("credential-shape backstop", () => {
 		expect(store.listEvents("audit-1")).toEqual([]);
 		expect(store.listGrants()).toEqual([]);
 		expect(store.getPending("audit-1")).toBeUndefined();
+	});
+
+	test("screens the escalation context, naming which channel leaked", () => {
+		store.beginAudit({
+			auditId: "audit-1",
+			toolCallId: "call-1",
+			toolName: "bash",
+			operation: "exec",
+			targetSummary: "command:deploy",
+			argumentsHash: "sha256:9f2c1a",
+			canonicalHash: "sha256:41bd7e",
+			policyHash: "policy-1",
+			sourceAgentId: "main",
+			sourceAgentKind: "main",
+			cwd: CWD_FIXTURE,
+			retryFamilyKey: "family-1",
+			createdAt: T0,
+		});
+
+		const context: EscalationContext = {
+			userIntent: "deploy the service",
+			agentRationale: "running the deploy script",
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
+			flaggedBy: "judge",
+		};
+
+		const base: PendingApproval = {
+			auditId: "audit-1",
+			toolName: "bash",
+			operation: "exec",
+			targetSummary: "command:deploy",
+			risk: "exfiltration",
+			rationale: "Sends repository contents to a remote host.",
+			argumentsHash: "sha256:9f2c1a",
+			canonicalHash: "sha256:41bd7e",
+			policyHash: "policy-1",
+			nonce: "nonce-1",
+			sourceAgentId: "main",
+			cwd: CWD_FIXTURE,
+			state: "awaiting-human",
+			createdAt: T0,
+			expiresAt: T0 + 60_000,
+			exemptAttempts: 0,
+			context,
+		};
+
+		for (const channel of ["userIntent", "agentRationale"] as const) {
+			let caught: unknown;
+			try {
+				store.putPending({ ...base, context: { ...context, [channel]: `use ${SECRETS.apiToken}` } });
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(StoreRedactionError);
+			expect(caught instanceof StoreRedactionError ? caught.field : "").toBe(`putPending.context.${channel}`);
+			expect(store.getPending("audit-1")).toBeUndefined();
+		}
+
+		expect(() => store.putPending(base)).not.toThrow();
+		expect(store.getPending("audit-1")?.context?.userIntent).toBe("deploy the service");
 	});
 
 	test("accepts the deterministic placeholders the obfuscator leaves behind", () => {

@@ -138,6 +138,16 @@ const judgeSchema = z
 		/** Hard ceiling on judge output bytes. Larger output is a malformed verdict. */
 		maxOutputBytes: z.number().int().positive().max(64_000).default(4_000),
 		maxOutputTokens: z.number().int().positive().max(8_000).default(1_000),
+		/**
+		 * Hard ceiling on the assembled prompt. Refuse to judge rather than send it.
+		 *
+		 * Nothing else bounds the request in aggregate: `scope.argumentSizeThreshold`
+		 * samples oversized fields but exempts each preserved field name up to 64 KB,
+		 * and there are nine of those. Over this ceiling the plugin fails closed to an
+		 * escalation instead of paying for, and trusting, a judgment made on a prompt
+		 * too large to have been read carefully. Legitimate calls are nowhere near it.
+		 */
+		maxPromptBytes: z.number().int().positive().max(1_000_000).default(96_000),
 	})
 	.strict();
 

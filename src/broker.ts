@@ -41,6 +41,11 @@ export interface BrokerEndpoint {
 	 * Returns `undefined` for no UI, cancellation, or timeout — never approval.
 	 */
 	present(request: EscalationRequest, signal: AbortSignal): Promise<HumanDecision | undefined>;
+	/**
+	 * Deliver one line to the human, without asking for a decision. Optional: an
+	 * endpoint that cannot reach a person simply omits it.
+	 */
+	notifyPending?(line: string): void;
 }
 
 /** A pending escalation whose literal arguments are still available. */
@@ -113,6 +118,26 @@ export function humanEndpoint(): BrokerEndpoint | undefined {
 /** Is there a live main-session approval channel right now? Checked synchronously. */
 export function hasHumanChannel(): boolean {
 	return humanEndpoint() !== undefined;
+}
+
+/**
+ * Tell the human one line about an escalation they now have to decide out of
+ * band. Returns whether anyone heard.
+ *
+ * Best-effort by construction: a throwing notify is swallowed, because a broken
+ * status line must never change a safety verdict. Routed through
+ * {@link humanEndpoint} for the same reason `present` is, so a subagent's
+ * escalation surfaces in the main session rather than nowhere.
+ */
+export function notifyHuman(line: string): boolean {
+	const endpoint = humanEndpoint();
+	if (endpoint?.notifyPending === undefined) return false;
+	try {
+		endpoint.notifyPending(line);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // ---------------------------------------------------------------------------

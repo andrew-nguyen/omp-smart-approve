@@ -120,12 +120,19 @@ function gateWith(options: {
 			operation: request.canonicalCall.operation,
 			argumentsView: "{}",
 			targets: [...request.canonicalCall.targets],
+			omittedTargets: 0,
 			sourceAgentId: request.sourceAgentId,
 			recentActions: [],
 			policyDocuments: [],
 			postureHints: [],
 			sensitivity: "balanced",
 			incompleteCriticalContext: false,
+		}),
+		buildEscalationContext: () => ({
+			userIntent: "u",
+			agentRationale: "a",
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
 		}),
 	});
 }

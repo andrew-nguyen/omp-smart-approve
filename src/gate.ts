@@ -40,6 +40,9 @@ import type {
 	AuditRecord,
 	CanonicalCall,
 	Decision,
+	EscalationBackground,
+	EscalationContext,
+	EscalationFlaggedBy,
 	FrozenCall,
 	GatePorts,
 	GateRequest,
@@ -77,6 +80,12 @@ export interface GateDependencies {
 	ports: GatePorts;
 	/** Builds the redacted judge snapshot. Injected so the gate stays testable. */
 	buildJudgeInput(request: GateRequest, context: JudgeContextInput): JudgeInput;
+	/**
+	 * Builds the human-facing half of the same capture the judge sees. Injected
+	 * beside {@link buildJudgeInput} so both read one tracker and cannot disagree
+	 * about what the session asked for.
+	 */
+	buildEscalationContext(): EscalationBackground;
 	/** Publishes a companion risk card next to OMP's native prompt. */
 	publishRiskCard?(card: RiskCard): void;
 	/** True when this session is deliberately unguarded by a human. */
@@ -102,19 +111,138 @@ export interface RiskCard {
 	rationale: string;
 	targetSummary: string;
 	judgeAvailable: boolean;
+	/** Decision support. The stage is omitted: no escalation record exists here. */
+	context?: EscalationBackground;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** One-line, redacted description of where a call points. Safe to persist. */
+/**
+ * Characters that can move a terminal cursor off the current line: C0 and C1
+ * controls (including ESC, CR, and LF) plus the Unicode line and paragraph
+ * separators.
+ */
+const CONTROLS = /[\p{Cc}\p{Zl}\p{Zp}]/gu;
+
+/** The same set, plus the backslash that makes an escape unambiguous. */
+const CONTROLS_OR_BACKSLASH = /[\\\p{Cc}\p{Zl}\p{Zp}]/gu;
+
+/** Short forms for the three a reader recognizes on sight; everything else is `\uXXXX`. */
+const CONTROL_NAMES: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
+
+function escapeControl(character: string): string {
+	return CONTROL_NAMES[character] ?? `\\u${(character.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`;
+}
+
+/**
+ * Make a summary safe to persist and safe to render, without losing what it says.
+ *
+ * Escaping rather than stripping is the whole point. A POSIX filename may contain
+ * a newline or a tab, so `a\nb.txt` and `a b.txt` are two different files;
+ * replacing controls with spaces would persist one string for both and, worse,
+ * would make the deliberate injection attempt indistinguishable from a mundane
+ * filename. The backslash is escaped too, so the mapping stays injective and a
+ * reader can tell a real backslash from one we introduced.
+ */
+export function escapeSummary(text: string): string {
+	return text.replace(CONTROLS_OR_BACKSLASH, character => (character === "\\" ? "\\\\" : escapeControl(character)));
+}
+
+/**
+ * Defang every terminal control in operator-facing text, leaving length alone.
+ *
+ * `\s` normalization is not a substitute: JavaScript's `\s` matches none of ESC,
+ * BEL, backspace, or C1 NEL (U+0085), and a terminal acts on all four. ESC alone
+ * can clear the screen, move the cursor up, and rewrite a row the operator has
+ * already read, which is the same forgery as a bare newline with more reach.
+ *
+ * Unlike {@link escapeSummary} this leaves backslashes alone, so it is idempotent
+ * and safe to apply on top of an already-escaped value.
+ */
+export function escapeControls(text: string): string {
+	return text.replace(CONTROLS, escapeControl);
+}
+
+/**
+ * How much of any one-line summary an operator surface will show, whether that
+ * is a target or a judge rationale.
+ *
+ * A readability bound, NOT a security guarantee. Visual rows depend on the
+ * reader's terminal width, which this process cannot know, so nothing here can
+ * promise anything about where text lands on a screen. What it does buy is that
+ * neither a multi-kilobyte target nor a 2000-character model rationale can flood
+ * a block that has to be read before a decision.
+ */
+export const DISPLAY_SUMMARY_MAX = 200;
+
+/**
+ * A summary an operator can actually read, on one line.
+ *
+ * Display only. It is deliberately NOT applied before persistence: the literal
+ * arguments are never written to disk, so `targetSummary` is the only durable
+ * human-readable record of where a call pointed. Truncating it on the way in
+ * would destroy that record precisely for the oversized, anomalous targets an
+ * incident review most needs to read.
+ *
+ * Escapes controls but not backslashes, which makes it idempotent over anything
+ * {@link escapeSummary} already produced: only a record written by a build that
+ * predates that escaping can still carry a raw control character here, and this
+ * is the last thing between such a row and the operator.
+ *
+ * Truncation keeps both ends, because a path is identified by its tail and a URL
+ * by its head, and says how much it dropped rather than trailing off silently.
+ */
+export function displaySummary(text: string): string {
+	const safe = escapeControls(text);
+	if (safe.length <= DISPLAY_SUMMARY_MAX) return safe;
+	const marker = `…(${safe.length} chars total)…`;
+	const head = Math.ceil((DISPLAY_SUMMARY_MAX - marker.length) * 0.7);
+	const tail = DISPLAY_SUMMARY_MAX - marker.length - head;
+	return `${safe.slice(0, head)}${marker}${safe.slice(safe.length - tail)}`;
+}
+
+/**
+ * One-line, redacted description of where a call points. Safe to persist.
+ *
+ * The one-line promise is load-bearing, not cosmetic. A target is an
+ * attacker-influenceable tool argument, and every operator surface interpolates
+ * this string into a sentence: the SBAR Situation line, the one-line async
+ * notification, the pending rows, and the review header. A target carrying a
+ * newline could otherwise forge a whole extra line of decision support, and a
+ * fake `R  ` recommendation lands ABOVE the real one.
+ *
+ * Escaped, never collapsed and never truncated. This value outlives the literal
+ * call, so it is the durable answer to which targets were named;
+ * {@link displaySummary} shortens it only where it has to fit on a line. It does
+ * still list at most four targets, so it identifies those four exactly rather
+ * than summarizing every target of a wider call.
+ *
+ * The literal call is untouched by this. The approval dialog renders it through
+ * `JSON.stringify`, which escapes control characters instead of emitting them,
+ * so the ground truth a human approves against stays byte-exact.
+ */
 export function summarizeTargets(call: CanonicalCall): string {
-	if (call.targets.length === 0) return `${call.toolName} (no resolved target)`;
-	return call.targets
-		.slice(0, 4)
-		.map(t => `${t.kind}:${t.resolved ?? t.requested}${t.dynamic ? " (unresolved)" : ""}`)
-		.join(", ");
+	const summary =
+		call.targets.length === 0
+			? `${call.toolName} (no resolved target)`
+			: call.targets
+					.slice(0, 4)
+					.map(t => `${t.kind}:${t.resolved ?? t.requested}${t.dynamic ? " (unresolved)" : ""}`)
+					.join(", ");
+	return escapeSummary(summary);
+}
+
+/**
+ * Which stage held the call, in the vocabulary the Recommendation line is keyed
+ * on. Posture clamps arrive as `"escalation"` and are the judge's finding plus a
+ * policy tightening, so they read as judge-flagged.
+ */
+function flaggedBy(stage: GateStage): EscalationFlaggedBy {
+	if (stage === "loop-breaker") return "loop-breaker";
+	if (stage === "judge-failure") return "judge-failure";
+	return "judge";
 }
 
 function blockReason(auditId: string, cause: string, nextAction: string): string {
@@ -591,6 +719,7 @@ export class Gate {
 			rationale,
 			targetSummary,
 			verdict !== undefined,
+			this.#deps.buildEscalationContext(),
 		);
 		return this.#noBlock(request, "judge", rationale);
 	}
@@ -619,6 +748,10 @@ export class Gate {
 		const now = ports.now();
 		const nonce = ports.randomNonce();
 
+		// One build per escalation, not per surface: the dialog, the durable record,
+		// and any later `review` must all describe the same moment.
+		const context: EscalationContext = { ...this.#deps.buildEscalationContext(), flaggedBy: flaggedBy(stage) };
+
 		const pending: PendingApproval = {
 			auditId: request.auditId,
 			toolName: request.toolName,
@@ -626,6 +759,7 @@ export class Gate {
 			targetSummary,
 			risk: verdict.risk,
 			rationale: verdict.rationale,
+			context,
 			argumentsHash: request.argumentsHash,
 			canonicalHash,
 			policyHash: resolved.policyHash,
@@ -656,7 +790,7 @@ export class Gate {
 			expiresAt: now + timeouts.brokerArgsTtlMs,
 		});
 
-		const decision = await this.#tryFastPath(request, verdict, nonce);
+		const decision = await this.#tryFastPath(request, verdict, nonce, context);
 
 		if (decision?.choice === "allow-once") {
 			store.updatePendingState(request.auditId, "approved-granted", ports.now());
@@ -708,6 +842,14 @@ export class Gate {
 		const cause = headless
 			? `${verdict.rationale} No interactive main session is available to approve it.`
 			: `${verdict.rationale} It needs a human decision, which does not fit in OMP's handler budget.`;
+
+		// The agent is told it was blocked; until now the human was told nothing.
+		// Fires at most once per escalation by construction: a retry of a call
+		// already under review reuses the open record and never reaches here.
+		broker.notifyHuman(
+			`Smart Approve held a ${displaySummary(request.toolName)} call targeting ${displaySummary(targetSummary)}. ` +
+				`Risk: ${verdict.risk}. Decide with /smart-approve review ${request.auditId}.`,
+		);
 		return this.#terminal(request, canonicalHash, targetSummary, {
 			decision: "block",
 			stage,
@@ -732,7 +874,7 @@ export class Gate {
 	 * floor. A window too short to read a literal call is worse than no window: it
 	 * pressures a human into a snap decision on a security question.
 	 */
-	async #tryFastPath(request: GateRequest, verdict: Verdict, nonce: string) {
+	async #tryFastPath(request: GateRequest, verdict: Verdict, nonce: string, context: EscalationContext) {
 		const { resolved, ports } = this.#deps;
 		const { timeouts, ui } = resolved.config;
 		if (!ui.fastPathDialog) return undefined;
@@ -753,6 +895,7 @@ export class Gate {
 					canonicalCall: request.canonicalCall,
 					risk: verdict.risk,
 					rationale: verdict.rationale,
+					context,
 					sourceAgentId: request.sourceAgentId,
 					sourceAgentKind: request.sourceAgentKind,
 					...(request.parentAgentId === undefined ? {} : { parentAgentId: request.parentAgentId }),
@@ -866,6 +1009,7 @@ export class Gate {
 		rationale: string,
 		targetSummary: string,
 		judgeAvailable: boolean,
+		context?: EscalationBackground,
 	): void {
 		if (!this.#deps.resolved.config.ui.riskCardOnNativePrompt) return;
 		this.#deps.publishRiskCard?.({
@@ -875,6 +1019,7 @@ export class Gate {
 			rationale,
 			targetSummary,
 			judgeAvailable,
+			...(context === undefined ? {} : { context }),
 		});
 	}
 

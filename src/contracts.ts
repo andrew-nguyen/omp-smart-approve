@@ -222,6 +222,11 @@ export interface JudgeInput {
 	/** Secret-obfuscated, size-bounded view of the arguments. */
 	argumentsView: string;
 	targets: CallTarget[];
+	/**
+	 * How many extracted targets were dropped to keep the request bounded. Never
+	 * silent: a nonzero value also forces {@link incompleteCriticalContext}.
+	 */
+	omittedTargets: number;
 	sourceAgentId: string;
 	recentActions: ProvenanceEntry[];
 	/** Authoritative natural-language policy from SMART_APPROVE.md files. */
@@ -248,6 +253,8 @@ export type JudgeFailureKind =
 	| "transport"
 	| "malformed-output"
 	| "output-too-large"
+	/** The assembled prompt exceeded `judge.maxPromptBytes`. Never retried: it will not shrink. */
+	| "input-too-large"
 	| "deadline-exhausted"
 	| "internal";
 
@@ -344,6 +351,35 @@ export interface Grant {
 }
 
 // ---------------------------------------------------------------------------
+// Escalation context
+// ---------------------------------------------------------------------------
+
+/**
+ * Which stage held the call. Keys the deterministic Recommendation line, so it
+ * is a closed set rather than a free-text stage name: every value must have a
+ * sentence a human can act on.
+ */
+export type EscalationFlaggedBy = "judge" | "judge-failure" | "loop-breaker";
+
+/**
+ * Human decision support, composed at escalation time from state the gate
+ * already holds. Never model-authored, never raw: both text fields arrive
+ * already redacted and clamped to one short line.
+ */
+export interface EscalationContext {
+	/** Redacted, one line, clamped by `SBAR_INTENT_MAX`. Empty means nothing was captured. */
+	userIntent: string;
+	/** Redacted, one line, clamped by `SBAR_RATIONALE_MAX`. Empty means no stated reason. */
+	agentRationale: string;
+	rationaleFreshness: RationaleFreshness;
+	rationaleFromReasoning: boolean;
+	flaggedBy: EscalationFlaggedBy;
+}
+
+/** Everything {@link EscalationContext} holds except the stage, which only the gate knows. */
+export type EscalationBackground = Omit<EscalationContext, "flaggedBy">;
+
+// ---------------------------------------------------------------------------
 // Pending approvals
 // ---------------------------------------------------------------------------
 
@@ -362,6 +398,11 @@ export interface PendingApproval {
 	targetSummary: string;
 	risk: RiskClass;
 	rationale: string;
+	/**
+	 * Decision support captured when the escalation opened. Absent on rows written
+	 * before context capture existed; a renderer says so rather than inventing one.
+	 */
+	context?: EscalationContext;
 	argumentsHash: string;
 	canonicalHash: string;
 	policyHash: string;
@@ -401,6 +442,7 @@ export interface EscalationRequest {
 	canonicalCall: CanonicalCall;
 	risk: RiskClass;
 	rationale: string;
+	context: EscalationContext;
 	sourceAgentId: string;
 	sourceAgentKind: string;
 	parentAgentId?: string;

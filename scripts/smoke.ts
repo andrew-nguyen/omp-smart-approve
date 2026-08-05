@@ -9,7 +9,7 @@
  *    asserts the expected handlers and command were registered through OMP's own
  *    extension API. Nothing is faked in this half.
  *
- * 2. **The gate enforces all seven representative paths.** Loads the named factory
+ * 2. **The gate enforces all nine representative paths.** Loads the named factory
  *    through OMP's real `loadExtensionFromFactory(...)` — so `api.on(...)` and
  *    `api.registerCommand(...)` still run against OMP's real API implementation —
  *    with scripted judge, UI, and clock ports. Only the provider, the terminal,
@@ -36,6 +36,7 @@ import type { JudgeInput, JudgeResult } from "../src/contracts.ts";
 import { createSmartApproveExtension } from "../src/index.ts";
 import { hashArguments } from "../src/policy.ts";
 import { openStore } from "../src/store.ts";
+import { WIDGET_APPROVAL } from "../src/ui.ts";
 
 const REPO = path.resolve(import.meta.dir, "..");
 
@@ -68,6 +69,8 @@ interface ScriptedUi {
 	selectAnswer: string | undefined;
 	selectCalls: string[];
 	widgets: Map<string, string[] | undefined>;
+	/** Every approval body the dialog rendered. The widget is cleared on close, so the map alone loses it. */
+	approvalBodies: string[][];
 	notices: string[];
 }
 
@@ -77,6 +80,7 @@ function makeUi(overrides: Partial<ScriptedUi> = {}): ScriptedUi {
 		selectAnswer: undefined,
 		selectCalls: [],
 		widgets: new Map(),
+		approvalBodies: [],
 		notices: [],
 		...overrides,
 	};
@@ -100,6 +104,7 @@ function makeCtx(ui: ScriptedUi, cwd: string, agentDir: string): ExtensionContex
 			setStatus: () => {},
 			setWidget: (key: string, lines: string[] | undefined) => {
 				ui.widgets.set(key, lines);
+				if (key === WIDGET_APPROVAL && lines !== undefined) ui.approvalBodies.push(lines);
 			},
 			theme: {},
 		},
@@ -375,6 +380,27 @@ async function run(): Promise<void> {
 				});
 				record("fast-path escalation approved once", "no block", result?.block ? "blocked" : "no block");
 				record("nonce-bound dialog shown exactly once", "1 dialog(s)", `${h.ui.selectCalls.length} dialog(s)`);
+
+				// The dialog leads with decision support, above the literal call it
+				// does not replace.
+				const body = h.ui.approvalBodies[0] ?? [];
+				// The Background section is two lines, so only the first carries the "B".
+				record(
+					"the dialog leads with an SBAR block",
+					"S |B |  |A |R ",
+					body
+						.slice(2, 7)
+						.map(line => line.slice(0, 2))
+						.join("|"),
+				);
+				assert(
+					body.some(line => line.includes("Literal arguments (complete, exactly as the agent wrote them):")),
+					"the SBAR displaced the literal-argument section",
+				);
+				assert(
+					body.some(line => line.startsWith("R  ")),
+					"the SBAR carried no Recommendation line",
+				);
 			} finally {
 				h.dispose();
 			}
@@ -666,6 +692,49 @@ async function run(): Promise<void> {
 					"a composed command is judged, not admitted by its read-only head",
 					"blocked after 1 judge calls",
 					`${composed?.block ? "blocked" : "allowed"} after ${judgeCalls} judge calls`,
+				);
+			} finally {
+				h.dispose();
+			}
+		}
+
+		// ---------------------- 9. an async escalation announces itself to the human
+		{
+			broker.resetBrokerForTests();
+			const clock = { value: 1_700_000_000_000 };
+			// Interactive main with no scripted answer: the dialog opens, resolves to
+			// nothing, and the escalation falls through to the asynchronous path.
+			const h = await buildHarness({
+				cwd,
+				agentDir,
+				home,
+				clock,
+				judge: () => ESCALATE,
+				ui: { hasUI: true, selectAnswer: undefined },
+			});
+			try {
+				const args = { path: "src/announced.ts", content: "needs review" };
+				const blocked = await callToolCall(h.extension, h.ctx, {
+					toolCallId: "c10",
+					toolName: "write",
+					input: args,
+				});
+				assert(blocked?.block === true, "the async escalation did not block");
+
+				const held = h.ui.notices.filter(notice => notice.startsWith("Smart Approve held a"));
+				record("an async escalation notifies the human once", "1 notice", `${held.length} notice`);
+				assert(
+					(held[0] ?? "").includes("Decide with /smart-approve review "),
+					`the notice did not name the review command: ${held[0]}`,
+				);
+
+				// A retry of the same call reuses the open record, so the human is not
+				// told twice about one decision.
+				await callToolCall(h.extension, h.ctx, { toolCallId: "c10-retry", toolName: "write", input: args });
+				record(
+					"a retry under review does not notify again",
+					"1 notice",
+					`${h.ui.notices.filter(notice => notice.startsWith("Smart Approve held a")).length} notice`,
 				);
 			} finally {
 				h.dispose();

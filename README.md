@@ -720,6 +720,12 @@ human answers:
   retry).
 - Malformed or oversized judge output. A verdict that does not parse is a judge
   failure, not an allow.
+- An oversized judgment request. The assembled prompt is measured against
+  `judge.maxPromptBytes` (96 KB by default) and refused *before* it is sent, so
+  no tokens are spent. An oversized request that reaches a provider can be
+  rejected, can time out, or can quietly succeed and return a verdict formed on
+  a prompt too large to have been read carefully. The first two are safe; the
+  third is silent, which is why the ceiling is enforced here instead.
 - Missing or unauthorized judge model.
 - Missing, invalid, or unparseable configuration.
 - Storage failure. **A scoped call cannot return allow until its terminal
@@ -780,6 +786,72 @@ The in-handler dialog is a **best-effort fast path only**. It is offered when a
 live main TUI exists, `ui.fastPathDialog` is on, and the remaining budget clears
 `timeouts.dialogFloorMs`. When it is not offered, or it times out, the call falls
 through to the durable pending record. Nothing is lost by missing it.
+
+### What you are shown when a call is held
+
+Every surface that asks you for a decision leads with the same compact SBAR
+block, composed deterministically from state the gate already held. It sits
+*above* the existing forensic detail; it replaces none of it.
+
+```text
+S  Held for your decision: bash exec targeting command:origin/main. Risk: destructive-action.
+B  You asked: "clean up the branch history".
+   Agent's reason: "force-pushing the rebased branch" (stated this turn).
+A  Flagged by the judge: Rewrites remote history that the user did not clearly request.
+R  Deny unless this matches what you asked for. Approving runs this exact call once, then re-locks.
+```
+
+- **Situation** is the call and its risk class.
+- **Background** is what you asked for and what the agent said it was doing,
+  each labelled with how closely it tracks this call: `stated this turn`,
+  `may predate this call`, or `from private reasoning, this turn`. An empty
+  channel renders as an explicit finding, never a blank: an agent acting with
+  no captured request is itself decision-relevant.
+- **Assessment** is the judge's own rationale, or the reason no judge verdict
+  exists.
+- **Recommendation** is a fixed sentence keyed on which mechanism held the call.
+  It is **never model-authored**. Tool arguments are attacker-influenceable
+  evidence, so a model-written recommendation acted on by a human would be a
+  laundering channel for prompt injection.
+
+The block is five rows, or one when the record predates context capture. Each
+channel is independently bounded: the captured intent, the agent's reason, the
+assessment, and the target summary all clamp to their own character budget, and
+every embedded control character is escaped so none of them can start a row of
+its own. The full, unclamped judge rationale still appears further down.
+
+**"Rows", not screen lines.** These are logical strings handed to the terminal.
+How many *visual* lines they occupy depends on your terminal width, which this
+process cannot know and does not try to guess — the Recommendation sentence
+alone already wraps below about 100 columns. The guarantee is that nothing an
+agent or a judge writes can add a row, not that the block occupies five lines on
+your screen.
+
+The ingredients are persisted, already redacted, on the durable record, so
+`review` and `pending` still show them after a restart. A record written before
+context capture existed says `(recorded before context capture)` rather than
+rendering blanks.
+
+**Which blocks get an SBAR.** Only the classes that actually request a human
+decision, because only those create a pending record: judge escalations,
+posture-clamp escalations, judge-failure escalations, and loop-breaker
+escalations, plus the native-prompt risk card. Deterministic deny rules,
+protected-target hits, judge hard blocks, no-judge-configured blocks,
+unsupported-host blocks, and store-failure blocks keep their existing one-line
+reason. None of them is overridable, so there is no decision to support.
+
+**You are told when one opens.** When an escalation falls through to the
+asynchronous path, the main session gets exactly one string, with any embedded
+control characters escaped so it cannot become two:
+
+```text
+Smart Approve held a bash call targeting command:origin/main. Risk: destructive-action. Decide with /smart-approve review a7f3c1.
+```
+
+It fires once per escalation, not once per retry: a retry of a call already
+under review reuses the open record. A headless session has nobody to tell, so
+it is a no-op, and a notification channel that throws can never change a
+verdict.
 
 The whole path finishes inside a self-imposed 28-second deadline
 (`timeouts.handlerSelfDeadlineMs`), strictly under OMP's cap. The plugin refuses
@@ -974,20 +1046,23 @@ one reads `advisory posture — still judged` and names exactly what is missing
 ### `pending`
 
 Every approval still open under `pendingApprovalTtl`: audit ID, tool, redacted
-target, risk, source agent, age, remaining TTL, and whether the record can still
-mint a grant or is intent-only.
+target, risk, what you asked for, source agent, age, remaining TTL, and whether
+the record can still mint a grant or is intent-only. The `asked:` row is omitted
+entirely for a record written before context capture existed, because an absent
+line is honest where `(no user request captured)` would be a claim.
 
 This is the entry point when the block message has scrolled away or the session
 restarted. It works with no arguments and with no live broker state.
 
 ### `review <audit-id>`
 
-The original redacted verdict, immutable history, retry family, human decisions,
-and any judge rule suggestion for one call. It prints the arguments hash, the
+Leads with the [SBAR block](#what-you-are-shown-when-a-call-is-held), then the
+original redacted verdict, immutable history, retry family, human decisions, and
+any judge rule suggestion for one call. It prints the arguments hash, the
 redacted target, and the working directory for both the verdict and the
-escalation record — which is where you copy the `argumentsHash` and `cwd` for a
+escalation record, which is where you copy the `argumentsHash` and `cwd` for a
 pinned `allow-exact` rule from. A row written before location tracking existed
-shows `(unknown — recorded before location tracking)` rather than a guess.
+shows `(unknown, recorded before location tracking)` rather than a guess.
 
 Literal arguments render **only** from the live in-memory broker. It never
 reconstructs them from persistence and never claims to show raw arguments it
@@ -1074,11 +1149,12 @@ validated surface.
 
 **I never see the approval dialog, only blocks with audit IDs.**
 Expected. Async escalation is the default; see
-[Why escalation is asynchronous](#why-escalation-is-asynchronous). Use
-`/smart-approve pending` and `/smart-approve review <audit-id>`. If you want the
-fast path to fire more often, raise `timeouts.dialogMaxMs` or lower
-`timeouts.dialogFloorMs` — but a dialog too short to read a literal call is worse
-than no dialog.
+[Why escalation is asynchronous](#why-escalation-is-asynchronous). Each one
+announces itself in the main session with a single line naming the call, the
+risk, and the `review` command that decides it. Use `/smart-approve pending` and
+`/smart-approve review <audit-id>`. If you want the fast path to fire more often,
+raise `timeouts.dialogMaxMs` or lower `timeouts.dialogFloorMs` — but a dialog too
+short to read a literal call is worse than no dialog.
 
 **Override refuses to grant and records intent instead.**
 The literal arguments have been evicted from the broker (10-minute default,
@@ -1186,15 +1262,20 @@ bun pm pack --dry-run  # package contents
 `bun run smoke` builds a throwaway HOME and agent directory, runs `omp plugin
 link` against this checkout, asserts the linked package appears enabled, loads
 the extension through OMP's real extension runner with scripted judge, UI, and
-time ports, and exercises six paths end to end:
+time ports, and exercises nine paths end to end:
 
 1. silent allow
-2. fast-path escalation with allow-once
+2. fast-path escalation with allow-once, leading with the SBAR block
 3. hard block
 4. native-prompt pre-screen with no second dialog
 5. async escalation ending as a pending block, approved out-of-band, with the
    identical retry executing exactly once
 6. headless escalation blocking
+7. user intent and current-turn rationale reaching the judge
+8. the read-only command floor skipping the judge, and a composed command not
+   inheriting its read-only head
+9. an async escalation notifying the human exactly once, including across a
+   retry that reuses the open record
 
 It inspects only redacted audit and session output, and removes the temporary
 directory in a `finally`. Scripted ports live only in the smoke script and the

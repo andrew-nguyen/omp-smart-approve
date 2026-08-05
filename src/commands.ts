@@ -28,6 +28,7 @@ import {
 	writableConfigPath,
 } from "./config.ts";
 import type { AuditEventType, GrantScope, PolicyRule, RuleKind, RuleSuggestion } from "./contracts.ts";
+import { displaySummary, escapeControls } from "./gate.ts";
 import { isExactTarget } from "./policy.ts";
 import type { AuditAggregate, SmartApproveStore } from "./store.ts";
 import {
@@ -40,6 +41,7 @@ import {
 	type StatusInput,
 	type UiHost,
 	WIDGET_BYPASS,
+	WIDGET_OVERRIDE,
 } from "./ui.ts";
 
 /** Everything an operator command changes is attributed to the person at the keyboard. */
@@ -489,8 +491,8 @@ async function rules(deps: CommandDeps, args: string[]): Promise<CommandResult> 
 			for (const rule of group.entries) {
 				lines.push(
 					`  ${rule.id}  [${rule.kind}]  ${group.origin}`,
-					`    ${rule.toolName} -> ${rule.target}  (${rulePosture(rule)})`,
-					`    specificity ${rule.specificity}, by ${rule.createdBy}: ${rule.reason}`,
+					`    ${escapeControls(rule.toolName)} -> ${escapeControls(rule.target)}  (${rulePosture(rule)})`,
+					`    specificity ${rule.specificity}, by ${rule.createdBy}: ${escapeControls(rule.reason)}`,
 				);
 			}
 			lines.push("");
@@ -514,8 +516,8 @@ async function rules(deps: CommandDeps, args: string[]): Promise<CommandResult> 
 				`Rule ${rule.id}`,
 				`  kind:        ${rule.kind}`,
 				`  posture:     ${rulePosture(rule)}`,
-				`  tool:        ${rule.toolName}`,
-				`  target:      ${rule.target}${isExactTarget(rule.target) ? " (exact)" : " (pattern)"}`,
+				`  tool:        ${escapeControls(rule.toolName)}`,
+				`  target:      ${escapeControls(rule.target)}${isExactTarget(rule.target) ? " (exact)" : " (pattern)"}`,
 				`  argsHash:    ${rule.argumentsHash ?? "(absent — cannot skip the judge)"}`,
 				`  cwd:         ${cwdField(rule)}`,
 				`  operation:   ${rule.operation ?? "(any)"}`,
@@ -547,7 +549,10 @@ async function rules(deps: CommandDeps, args: string[]): Promise<CommandResult> 
 		}
 		const confirmed = await deps.ui.confirm(
 			"Revoke rule",
-			`Revoke ${rule.kind} rule ${rule.id} (${rule.toolName} -> ${rule.target})?\n` +
+			// Revoking a deny rule widens the gate, so this confirm authorizes a
+			// change. A rule inserted from a judge suggestion carries model-authored
+			// tool and target text, deliberately stored raw so it still matches.
+			`Revoke ${rule.kind} rule ${rule.id} (${escapeControls(rule.toolName)} -> ${escapeControls(rule.target)})?\n` +
 				"Every outstanding allow grant is invalidated at the same time, in this and every\n" +
 				"other working directory. Deny rules are untouched.",
 		);
@@ -660,10 +665,17 @@ async function applySuggestion(deps: CommandDeps, auditId: string): Promise<Comm
 	}
 
 	const specificity = ruleSpecificity({ kind, target: suggestion.target });
+	// Preview only. Every field here is model-authored, and the confirm below is
+	// what authorizes a policy-rule insert, so a control sequence in `target` or
+	// `rationale` could forge the question the operator answers. The rule payload
+	// built after the confirm keeps the raw values: escaping a target would change
+	// what it matches.
+	const shownTool = escapeControls(suggestion.toolName);
+	const shownTarget = escapeControls(suggestion.target);
 	const preview: string[] = [
 		`Judge suggestion for ${auditId}`,
-		`  proposed:    ${suggestion.kind} ${suggestion.toolName} -> ${suggestion.target}`,
-		`  normalized:  ${kind} ${suggestion.toolName} -> ${suggestion.target}`,
+		`  proposed:    ${suggestion.kind} ${shownTool} -> ${shownTarget}`,
+		`  normalized:  ${kind} ${shownTool} -> ${shownTarget}`,
 		// Built from the same fields the rule would be inserted with, so a
 		// judge-suggested allow honestly reads as advisory: a suggestion can never
 		// carry an argumentsHash or a cwd, and therefore can never mint a bypass.
@@ -677,7 +689,7 @@ async function applySuggestion(deps: CommandDeps, auditId: string): Promise<Comm
 			specificity,
 		})}`,
 		`  specificity: ${specificity}`,
-		`  rationale:   ${suggestion.rationale}`,
+		`  rationale:   ${escapeControls(suggestion.rationale)}`,
 	];
 	if (downgraded) {
 		preview.push(
@@ -747,21 +759,36 @@ async function override(deps: CommandDeps, auditId: string): Promise<CommandResu
 		`OVERRIDE ${auditId}`,
 		"",
 		"Original verdict (append-only; nothing below rewrites it):",
+		// Every attacker-reachable string in this block is bounded to one line. The
+		// rationale is model output, so a prompt-injected judge could otherwise write
+		// rows here; the target may come from a legacy record that predates
+		// `escapeSummary`. Both are read while the chooser below is open, which is
+		// what makes this the most consequential block in the plugin.
 		committed === undefined
-			? `  ${record.state} — ${record.rationale}`
-			: `  ${committed.decision} at stage ${committed.stage} — ${committed.rationale}`,
+			? `  ${record.state} — ${displaySummary(record.rationale)}`
+			: `  ${committed.decision} at stage ${committed.stage} — ${displaySummary(committed.rationale)}`,
 		`  risk:   ${record.risk}`,
-		`  tool:   ${record.toolName} ${record.operation}`,
-		`  target: ${record.targetSummary}`,
+		`  tool:   ${displaySummary(record.toolName)} ${displaySummary(record.operation)}`,
+		`  target: ${displaySummary(record.targetSummary)}`,
 		`  agent:  ${record.sourceAgentId}`,
 		"",
 	];
 
-	const action = await deps.ui.select(`Override ${auditId}`, [
-		{ label: OVERRIDE_DENY, description: "Confirm the block. Available without the literal arguments." },
-		{ label: OVERRIDE_EXPIRE, description: "Close the record with no decision." },
-		{ label: OVERRIDE_APPROVE, description: "Approve this exact call." },
-	]);
+	// Put the context on screen BEFORE asking, the way the fast-path presenter
+	// does. The returned transcript is printed after the command finishes, which
+	// is too late to inform the choice: without this the operator picks between
+	// deny, expire, and approve with nothing but an audit ID in front of them.
+	deps.ui.setWidget(WIDGET_OVERRIDE, lines);
+	let action: string | undefined;
+	try {
+		action = await deps.ui.select(`Override ${auditId}`, [
+			{ label: OVERRIDE_DENY, description: "Confirm the block. Available without the literal arguments." },
+			{ label: OVERRIDE_EXPIRE, description: "Close the record with no decision." },
+			{ label: OVERRIDE_APPROVE, description: "Approve this exact call." },
+		]);
+	} finally {
+		deps.ui.setWidget(WIDGET_OVERRIDE, undefined);
+	}
 	if (action === undefined) {
 		lines.push("Cancelled. Nothing changed.");
 		return { lines };

@@ -5,6 +5,7 @@ import type { SecretEntry } from "@oh-my-pi/pi-coding-agent/secrets";
 import {
 	type BuildJudgeInputOptions,
 	buildArgumentsView,
+	buildEscalationContext,
 	buildJudgeInput,
 	createProvenanceTracker,
 	createRedactor,
@@ -14,6 +15,8 @@ import {
 	minimizeText,
 	type ProvenanceTracker,
 	type Redactor,
+	SBAR_INTENT_MAX,
+	SBAR_RATIONALE_MAX,
 } from "../src/context.ts";
 import type { CallTarget } from "../src/contracts.ts";
 
@@ -306,6 +309,7 @@ describe("judge input assembly", () => {
 				"agentRationale",
 				"argumentsView",
 				"incompleteCriticalContext",
+				"omittedTargets",
 				"operation",
 				"policyDocuments",
 				"postureHints",
@@ -462,5 +466,100 @@ describe("judge input assembly", () => {
 
 		expect(input.policyDocuments).toEqual(policyDocuments);
 		expect(input.policyDocuments).not.toBe(policyDocuments);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Escalation context
+// ---------------------------------------------------------------------------
+
+describe("escalation context", () => {
+	test("carries the captured intent and rationale with their freshness labels", () => {
+		const context = buildEscalationContext(trackerWith());
+
+		expect(context).toEqual({
+			userIntent: "add a changelog entry",
+			agentRationale: "appending one line to CHANGELOG.md",
+			rationaleFreshness: "previous-turn",
+			rationaleFromReasoning: false,
+		});
+	});
+
+	test("an empty tracker yields empty strings and no freshness claim", () => {
+		const context = buildEscalationContext(createProvenanceTracker({ redactor: inert }));
+
+		expect(context.userIntent).toBe("");
+		expect(context.agentRationale).toBe("");
+		expect(context.rationaleFreshness).toBe("none");
+		expect(context.rationaleFromReasoning).toBe(false);
+	});
+
+	test("clamps both channels to their own budget", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.recordUserMessage("u".repeat(SBAR_INTENT_MAX + 500));
+		tracker.recordAssistantRationale("r".repeat(SBAR_RATIONALE_MAX + 500));
+
+		const context = buildEscalationContext(tracker);
+
+		expect(context.userIntent).toHaveLength(SBAR_INTENT_MAX);
+		expect(context.agentRationale).toHaveLength(SBAR_RATIONALE_MAX);
+		expect(context.userIntent.endsWith("…")).toBe(true);
+		expect(context.agentRationale.endsWith("…")).toBe(true);
+	});
+
+	test("collapses multi-line capture to a single renderable line", () => {
+		const tracker = createProvenanceTracker({ redactor: inert });
+		tracker.recordUserMessage("  clean up\n\tthe branch   history\n");
+		tracker.recordAssistantRationale("force-pushing\nthe rebased branch");
+
+		const context = buildEscalationContext(tracker);
+
+		expect(context.userIntent).toBe("clean up the branch history");
+		expect(context.agentRationale).toBe("force-pushing the rebased branch");
+	});
+
+	test("reports a streaming rationale as this turn, exactly as the judge is told", () => {
+		const tracker = trackerWith();
+		tracker.observeInFlightRationale({ text: "checking the staged files", fromReasoning: true });
+
+		const context = buildEscalationContext(tracker);
+
+		expect(context.agentRationale).toBe("checking the staged files");
+		expect(context.rationaleFreshness).toBe("current-turn");
+		expect(context.rationaleFromReasoning).toBe(true);
+	});
+
+	test("never disagrees with the judge about what the session said", () => {
+		// Drift guard: an operator overriding a block and the judge that raised it
+		// must be looking at the same intent, the same rationale, and the same
+		// freshness. Only the display clamp may differ.
+		for (const mutate of [
+			(t: ProvenanceTracker) => t.recordAssistantRationale("rebasing onto trunk"),
+			(t: ProvenanceTracker) => t.observeInFlightRationale({ text: "about to push", fromReasoning: true }),
+			() => {},
+		]) {
+			const tracker = trackerWith();
+			mutate(tracker);
+
+			const judged = buildJudgeInput(optionsFor(tracker, { content: "x" }));
+			const context = buildEscalationContext(tracker);
+
+			expect(context.userIntent).toBe(judged.userIntent.slice(0, SBAR_INTENT_MAX));
+			expect(context.agentRationale).toBe(judged.agentRationale.slice(0, SBAR_RATIONALE_MAX));
+			expect(context.rationaleFreshness).toBe(judged.rationaleFreshness);
+			expect(context.rationaleFromReasoning).toBe(judged.rationaleFromReasoning);
+		}
+	});
+
+	test("redacts a configured secret in both channels", () => {
+		const tracker = createProvenanceTracker({ redactor: guarded });
+		tracker.recordUserMessage(`push using ${SECRET_VALUE}`);
+		tracker.recordAssistantRationale(`exporting ${SECRET_VALUE} first`);
+
+		const context = buildEscalationContext(tracker);
+
+		expect(context.userIntent).not.toContain(SECRET_VALUE);
+		expect(context.agentRationale).not.toContain(SECRET_VALUE);
+		expect(context.userIntent).toMatch(PLACEHOLDER_SHAPE);
 	});
 });

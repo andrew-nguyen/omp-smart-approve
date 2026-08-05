@@ -20,13 +20,16 @@ import type { ResolvedConfig } from "./config.ts";
 import type {
 	AuditEvent,
 	AuditRecord,
+	EscalationBackground,
+	EscalationContext,
 	EscalationRequest,
 	FrozenCall,
 	HumanDecision,
 	PendingApproval,
+	RiskClass,
 	RuleSuggestion,
 } from "./contracts.ts";
-import { type RiskCard, summarizeTargets } from "./gate.ts";
+import { displaySummary, escapeControls, type RiskCard, summarizeTargets } from "./gate.ts";
 import { hashArguments } from "./policy.ts";
 import type { AuditAggregate } from "./store.ts";
 
@@ -40,6 +43,12 @@ export const WIDGET_RISK_CARD = "smart-approve:risk";
 export const WIDGET_BYPASS = "smart-approve:bypass";
 /** Scrollable body of the full-call approval view, owned by the presenter. */
 export const WIDGET_APPROVAL = "smart-approve:approval";
+/**
+ * Decision context for `/smart-approve override`, shown while the operator
+ * chooses. Its own key, not {@link WIDGET_APPROVAL}: a fast-path dialog can be
+ * open in a tool-call handler at the same time, and neither may clear the other.
+ */
+export const WIDGET_OVERRIDE = "smart-approve:override";
 export const STATUS_KEY = "smart-approve";
 
 /**
@@ -107,6 +116,121 @@ function formatArguments(args: Readonly<Record<string, unknown>>): ArgumentRende
 }
 
 // ---------------------------------------------------------------------------
+// SBAR
+// ---------------------------------------------------------------------------
+
+/**
+ * Assessment budget. The full rationale still appears verbatim further down
+ * every surface, so this clamp costs a reader nothing and buys a glanceable
+ * block.
+ */
+const SBAR_ASSESSMENT_MAX = 220;
+
+/**
+ * One complete sentence, whitespace collapsed, controls defanged, length bounded.
+ *
+ * The escape runs first and is not optional: `\s` matches none of ESC, BEL,
+ * backspace, or C1 NEL, so whitespace collapsing alone would hand a
+ * judge-authored cursor-control sequence straight to the terminal.
+ *
+ * Never exceeds `limit`: a truncated line ends in an ellipsis, which is itself
+ * terminal punctuation and is honest about the cut.
+ */
+function clampSentence(text: string, limit: number): string {
+	const collapsed = escapeControls(text).replace(/\s+/g, " ").trim();
+	if (collapsed.length === 0) return "";
+	if (/[.!?]$/.test(collapsed)) return collapsed.length <= limit ? collapsed : `${collapsed.slice(0, limit - 1)}…`;
+	if (collapsed.length < limit) return `${collapsed}.`;
+	return `${collapsed.slice(0, limit - 1)}…`;
+}
+
+/**
+ * How closely the stated reason tracks this call.
+ *
+ * Staleness dominates: a reason carried over from an earlier turn is labelled as
+ * possibly stale even when it came from private reasoning, because "this may not
+ * be about the call in front of you" is the more decision-relevant warning.
+ */
+function freshnessLabel(context: EscalationBackground): string {
+	if (context.rationaleFreshness === "previous-turn") return "may predate this call";
+	return context.rationaleFromReasoning ? "from private reasoning, this turn" : "stated this turn";
+}
+
+/**
+ * The two Background sentences.
+ *
+ * An empty channel renders as an explicit finding rather than a blank: an agent
+ * acting with no captured request is exactly the case an operator must see.
+ *
+ * Both channels are model- or user-authored and are only `\s`-normalized at
+ * capture, so the control escape happens here, at the surface that renders them.
+ */
+export function renderBackground(context: EscalationBackground): [string, string] {
+	const intent = escapeControls(context.userIntent);
+	const rationale = escapeControls(context.agentRationale);
+	return [
+		intent.length === 0 ? "No user request was captured this session." : `You asked: "${intent}".`,
+		rationale.length === 0
+			? "The agent stated no reason for this call."
+			: `Agent's reason: "${rationale}" (${freshnessLabel(context)}).`,
+	];
+}
+
+/** Deterministic, stage-keyed. Never model-authored: this is the line acted on. */
+const RECOMMENDATION: Record<EscalationContext["flaggedBy"], string> = {
+	judge: "Deny unless this matches what you asked for. Approving runs this exact call once, then re-locks.",
+	"judge-failure":
+		"The judge did not screen this call. Approve only if you can verify the literal arguments yourself.",
+	"loop-breaker":
+		"The agent has retried this operation repeatedly. Deny unless you explicitly want it, and consider steering the agent.",
+};
+
+function assessment(rationale: string, flaggedBy: EscalationContext["flaggedBy"]): string {
+	const detail = clampSentence(rationale, SBAR_ASSESSMENT_MAX);
+	if (flaggedBy === "judge-failure") return `The judge never screened this call: ${detail}`;
+	if (flaggedBy === "loop-breaker") return `Flagged by the retry loop breaker: ${detail}`;
+	return `Flagged by the judge: ${detail}`;
+}
+
+/**
+ * The decision support block every escalation surface leads with.
+ *
+ * Situation, Background, Assessment, Recommendation, composed deterministically
+ * from state the gate already held. Nothing here is model-authored: a human
+ * acting on a Recommendation written by the same class of system that produced
+ * the attacker-influenceable arguments would be laundering the injection.
+ */
+export function renderSbar(input: {
+	toolName: string;
+	operation: string;
+	targetSummary: string;
+	risk: RiskClass;
+	rationale: string;
+	context?: EscalationContext;
+}): string[] {
+	const context = input.context;
+	// Written before capture existed. Say so rather than render an empty block,
+	// which would read as "nothing was asked" instead of "nothing was recorded".
+	if (context === undefined) return ["(recorded before context capture)"];
+
+	const background = renderBackground(context);
+	return [
+		// `operation` is `${toolName}:${args.action}` for action-style tools, so it is
+		// a fully agent-controlled string, not a closed enum.
+		`S  Held for your decision: ${displaySummary(input.toolName)} ${displaySummary(input.operation)} ` +
+			// Clamped on the way out, never on the way in. A record written before
+			// `summarizeTargets` collapsed control characters is still live under
+			// `pendingApprovalTtl`, and an oversized target would swamp a block the
+			// plan requires to be short. The durable record keeps the full summary.
+			`targeting ${displaySummary(input.targetSummary)}. Risk: ${input.risk}.`,
+		`B  ${background[0]}`,
+		`   ${background[1]}`,
+		`A  ${assessment(input.rationale, context.flaggedBy)}`,
+		`R  ${RECOMMENDATION[context.flaggedBy]}`,
+	];
+}
+
+// ---------------------------------------------------------------------------
 // Full-call approval view
 // ---------------------------------------------------------------------------
 
@@ -116,17 +240,31 @@ function formatArguments(args: Readonly<Record<string, unknown>>): ArgumentRende
  */
 export function renderApprovalRequest(request: EscalationRequest, remainingMs: number): string[] {
 	const lines: string[] = [
-		"SMART APPROVE — human approval required",
+		"SMART APPROVE: human approval required",
+		"",
+		...renderSbar({
+			toolName: request.frozenCall.toolName,
+			operation: request.canonicalCall.operation,
+			targetSummary: summarizeTargets(request.canonicalCall),
+			risk: request.risk,
+			rationale: request.rationale,
+			context: request.context,
+		}),
+		"",
 		`Audit ID:     ${request.auditId}`,
 		`Source agent: ${request.sourceAgentId} (${request.sourceAgentKind})`,
 	];
 	if (request.parentAgentId !== undefined) lines.push(`Parent agent: ${request.parentAgentId}`);
 	lines.push(
-		`Tool:         ${request.frozenCall.toolName}`,
-		`Operation:    ${request.canonicalCall.operation}`,
+		`Tool:         ${displaySummary(request.frozenCall.toolName)}`,
+		`Operation:    ${displaySummary(request.canonicalCall.operation)}`,
 		`Destination:  ${summarizeTargets(request.canonicalCall)}`,
 		`Risk:         ${request.risk}`,
-		`Judge:        ${request.rationale}`,
+		// Pre-authorization: the presenter publishes this widget and then opens the
+		// Allow-once / Deny select, so a judge-authored control sequence here is the
+		// same forgery channel as one in the SBAR. Escaped, never clamped: this is
+		// the line that promises the full, unabridged rationale.
+		`Judge:        ${escapeControls(request.rationale)}`,
 		`Call hash:    ${request.frozenCall.argumentsHash}`,
 		`Expires in:   ${formatDuration(remainingMs)}`,
 		"",
@@ -136,7 +274,7 @@ export function renderApprovalRequest(request: EscalationRequest, remainingMs: n
 	lines.push(...(rendered.ok ? rendered.lines : [`<arguments cannot be rendered: ${rendered.reason}>`]));
 	lines.push(
 		"",
-		"Deny is the default. Approve only this exact call — approval is single-use",
+		"Deny is the default. Approve only this exact call. Approval is single-use",
 		"and bound to the call hash above.",
 	);
 	return lines;
@@ -170,7 +308,7 @@ export function createApprovalPresenter(
 		try {
 			choice = await raceAbort(
 				ui.select(
-					`Smart Approve: ${request.frozenCall.toolName} from ${request.sourceAgentId} (${request.auditId})`,
+					`Smart Approve: ${displaySummary(request.frozenCall.toolName)} from ${request.sourceAgentId} (${request.auditId})`,
 					[
 						{ label: CHOICE_DENY, description: "Block this call. Default." },
 						{ label: CHOICE_ALLOW_ONCE, description: "Run this exact call once, then re-lock." },
@@ -219,18 +357,25 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | und
 /**
  * Companion lines for a call OMP already prompts about. OMP's own dialog is the
  * sole approval control and already shows the literal call, so this card carries
- * only redacted judgment — never arguments.
+ * only redacted judgment, never arguments.
  */
 export function renderRiskCard(card: RiskCard): string[] {
-	return [
-		`SMART APPROVE pre-screen — risk: ${card.risk}`,
-		`Tool:        ${card.toolName}`,
-		`Destination: ${card.targetSummary}`,
-		`Finding:     ${card.rationale}`,
-		`Judge:       ${card.judgeAvailable ? "available" : "UNAVAILABLE — this call was not semantically screened"}`,
+	const lines = [
+		`SMART APPROVE pre-screen. Risk: ${card.risk}.`,
+		`Tool:        ${displaySummary(card.toolName)}`,
+		`Destination: ${displaySummary(card.targetSummary)}`,
+	];
+	if (card.context !== undefined) {
+		const background = renderBackground(card.context);
+		lines.push(`Context:     ${background[0]}`, `             ${background[1]}`);
+	}
+	lines.push(
+		`Finding:     ${escapeControls(card.rationale)}`,
+		`Judge:       ${card.judgeAvailable ? "available" : "UNAVAILABLE. This call was not semantically screened."}`,
 		`Audit ID:    ${card.auditId}`,
 		"OMP's prompt below remains the only approval control.",
-	];
+	);
+	return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,9 +396,22 @@ export function renderPendingList(pending: readonly PendingApproval[], now: numb
 		lines.push(
 			"",
 			`  ${record.auditId}  [${record.state}]`,
-			`    tool:      ${record.toolName} ${record.operation}`,
-			`    target:    ${record.targetSummary}`,
+			`    tool:      ${displaySummary(record.toolName)} ${displaySummary(record.operation)}`,
+			`    target:    ${displaySummary(record.targetSummary)}`,
 			`    risk:      ${record.risk}`,
+		);
+		// Omitted entirely for a row written before capture existed: an absent line
+		// is honest there, where "(no user request captured)" would be a claim.
+		if (record.context !== undefined) {
+			lines.push(
+				`    asked:     ${
+					record.context.userIntent.length === 0
+						? "(no user request captured)"
+						: `"${escapeControls(record.context.userIntent)}"`
+				}`,
+			);
+		}
+		lines.push(
 			`    agent:     ${record.sourceAgentId}${
 				record.parentAgentId === undefined ? "" : ` (parent ${record.parentAgentId})`
 			}`,
@@ -262,7 +420,7 @@ export function renderPendingList(pending: readonly PendingApproval[], now: numb
 			`    approval:  ${
 				authority.kind === "mintable"
 					? "can mint an exact grant"
-					: `intent-only — literal arguments are gone (${authority.reason})`
+					: `intent-only. The literal arguments are gone (${authority.reason}).`
 			}`,
 		);
 	}
@@ -434,7 +592,23 @@ export interface ReviewInput {
 }
 
 export function renderReview(input: ReviewInput): string[] {
-	const lines: string[] = [`SMART APPROVE REVIEW — ${input.auditId}`, ""];
+	const lines: string[] = [`SMART APPROVE REVIEW: ${input.auditId}`, ""];
+
+	// The escalation record is the only place decision support lives, so a review
+	// of a call that was never escalated leads with the verdict instead.
+	if (input.pending !== undefined) {
+		lines.push(
+			...renderSbar({
+				toolName: input.pending.toolName,
+				operation: input.pending.operation,
+				targetSummary: input.pending.targetSummary,
+				risk: input.pending.risk,
+				rationale: input.pending.rationale || input.record?.rationale || "",
+				...(input.pending.context === undefined ? {} : { context: input.pending.context }),
+			}),
+			"",
+		);
+	}
 
 	const record = input.record;
 	if (record === undefined) {
@@ -444,13 +618,13 @@ export function renderReview(input: ReviewInput): string[] {
 			"Original verdict (immutable):",
 			`  decision: ${record.decision} at stage ${record.stage}`,
 			`  risk:     ${record.risk}`,
-			`  reason:   ${record.rationale}`,
-			`  tool:     ${record.toolName} ${record.operation}`,
-			`  target:   ${record.targetSummary}`,
+			`  reason:   ${escapeControls(record.rationale)}`,
+			`  tool:     ${displaySummary(record.toolName)} ${displaySummary(record.operation)}`,
+			`  target:   ${displaySummary(record.targetSummary)}`,
 			`  agent:    ${record.sourceAgentId} (${record.sourceAgentKind})`,
 			// Location matters to the decision: a grant minted here is bound to this
 			// directory and will not admit the same call from anywhere else.
-			`  cwd:      ${record.cwd || "(unknown — recorded before location tracking)"}`,
+			`  cwd:      ${record.cwd || "(unknown, recorded before location tracking)"}`,
 			`  hash:     ${record.argumentsHash}`,
 			`  judge:    ${record.judgeModel ?? "(none)"}${record.judgeProvider === undefined ? "" : ` @ ${record.judgeProvider}`}`,
 		);
@@ -466,7 +640,7 @@ export function renderReview(input: ReviewInput): string[] {
 			`  state:    ${pending.state}`,
 			`  opened:   ${formatDuration(input.now - pending.createdAt)} ago`,
 			`  ttl left: ${formatDuration(pending.expiresAt - input.now)}`,
-			`  cwd:      ${pending.cwd || "(unknown — recorded before location tracking)"}`,
+			`  cwd:      ${pending.cwd || "(unknown, recorded before location tracking)"}`,
 			`  attempts absorbed under strike exemption: ${pending.exemptAttempts}`,
 		);
 	}
@@ -480,7 +654,7 @@ export function renderReview(input: ReviewInput): string[] {
 		);
 	} else {
 		lines.push(
-			"  Intent-only — literal arguments are gone.",
+			"  Intent-only. The literal arguments are gone.",
 			`  ${input.authority.reason}.`,
 			"  `/smart-approve override` can still deny or expire it, and can record intent to",
 			"  approve, but it cannot mint a grant. The next materially identical call re-opens a",
@@ -511,18 +685,15 @@ export function renderReview(input: ReviewInput): string[] {
 	if (humanEvents.length === 0) lines.push("  (none)");
 	for (const event of humanEvents) lines.push(`  ${event.type} by ${event.actor}: ${event.detail}`);
 
-	lines.push(
-		"",
-		`Retry family: ${input.retryFamilyKey ?? "(unknown)"} — ${input.strikes} strike${input.strikes === 1 ? "" : "s"}`,
-	);
+	lines.push("", `Retry family: ${input.retryFamilyKey ?? "(unknown)"}. Strikes: ${input.strikes}.`);
 
 	lines.push("", "Judge rule suggestion:");
 	if (input.suggestion === undefined) {
 		lines.push("  (none held in memory)");
 	} else {
 		lines.push(
-			`  ${input.suggestion.kind} ${input.suggestion.toolName} -> ${input.suggestion.target}`,
-			`  ${input.suggestion.rationale}`,
+			`  ${input.suggestion.kind} ${escapeControls(input.suggestion.toolName)} -> ${escapeControls(input.suggestion.target)}`,
+			`  ${escapeControls(input.suggestion.rationale)}`,
 			"  Non-binding. Apply with `/smart-approve apply-suggestion <audit-id>`.",
 		);
 	}

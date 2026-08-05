@@ -30,6 +30,7 @@ import {
 import { obfuscateToolArguments, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
 import type {
 	CallTarget,
+	EscalationBackground,
 	JudgeInput,
 	ProvenanceEntry,
 	ProvenanceSource,
@@ -576,6 +577,29 @@ export function buildArgumentsView(
 /** How much of the provenance ring the judge sees. Bounded for tokens and latency. */
 const RECENT_ACTION_LIMIT = 12;
 
+/**
+ * Aggregate bound on the targets section.
+ *
+ * Targets are extracted from the arguments but rendered OUTSIDE
+ * {@link buildArgumentsView}, so without these a single 200 KB `path` adds about
+ * 400 KB to the prompt (requested plus resolved) while the arguments view
+ * honestly reports a kilobyte, and a large `paths[]` multiplies that per entry.
+ * A 60 KB path is worse still: it sits under `MAX_PRESERVED_FIELD_BYTES`, so the
+ * arguments view keeps it whole, `incompleteCriticalContext` stays false, and the
+ * judge may answer `allow` on a request too large to have been read carefully.
+ *
+ * Both limits mirror the argument-view sampler's own numbers so one call cannot
+ * be bounded generously in one channel and tightly in the other.
+ */
+const MAX_JUDGE_TARGETS = MAX_PRESERVED_FRAGMENTS;
+const TARGET_VALUE_MAX = MAX_FRAGMENT_CHARS;
+
+/** Clamp one target value, saying how much it dropped rather than trailing off. */
+function boundTargetValue(value: string): { text: string; clamped: boolean } {
+	if (value.length <= TARGET_VALUE_MAX) return { text: value, clamped: false };
+	return { text: `${value.slice(0, TARGET_VALUE_MAX)} [truncated, ${value.length} chars]`, clamped: true };
+}
+
 export interface BuildJudgeInputOptions {
 	toolName: string;
 	operation: string;
@@ -601,6 +625,21 @@ export interface BuildJudgeInputOptions {
 export function buildJudgeInput(input: BuildJudgeInputOptions): JudgeInput {
 	const view = buildArgumentsView(input.rawArguments, input.threshold, input.redactor);
 	const rationale = input.tracker.rationaleView();
+
+	// Bound the targets section the same way the arguments view is bounded, and
+	// treat anything dropped here as incomplete critical context. Hiding part of
+	// what a call points at is exactly the state in which `allow` must not be an
+	// available answer.
+	const omittedTargets = Math.max(0, input.targets.length - MAX_JUDGE_TARGETS);
+	let targetsClamped = false;
+	const targets = input.targets.slice(0, MAX_JUDGE_TARGETS).map(target => {
+		const requested = boundTargetValue(minimizeText(input.redactor.redactText(target.requested)));
+		targetsClamped ||= requested.clamped;
+		if (target.resolved === undefined) return { ...target, requested: requested.text };
+		const resolved = boundTargetValue(minimizeText(input.redactor.redactText(target.resolved)));
+		targetsClamped ||= resolved.clamped;
+		return { ...target, requested: requested.text, resolved: resolved.text };
+	});
 	return {
 		// The user is the authority the judge measures the call against, so intent is
 		// not fenced as untrusted evidence — only defanged against fence forgery.
@@ -614,13 +653,7 @@ export function buildJudgeInput(input: BuildJudgeInputOptions): JudgeInput {
 		toolName: input.toolName,
 		operation: input.operation,
 		argumentsView: wrapEvidence(view.text),
-		targets: input.targets.map(target => ({
-			...target,
-			requested: minimizeText(input.redactor.redactText(target.requested)),
-			...(target.resolved === undefined
-				? {}
-				: { resolved: minimizeText(input.redactor.redactText(target.resolved)) }),
-		})),
+		targets,
 		sourceAgentId: input.sourceAgentId,
 		recentActions: input.tracker.recent(RECENT_ACTION_LIMIT).map(entry => ({
 			...entry,
@@ -630,6 +663,40 @@ export function buildJudgeInput(input: BuildJudgeInputOptions): JudgeInput {
 		policyDocuments: [...input.policyDocuments],
 		postureHints: [...input.postureHints],
 		sensitivity: input.sensitivity,
-		incompleteCriticalContext: view.incompleteCriticalContext,
+		omittedTargets,
+		incompleteCriticalContext: view.incompleteCriticalContext || targetsClamped || omittedTargets > 0,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Escalation context
+// ---------------------------------------------------------------------------
+
+/**
+ * Conciseness budgets for the human-facing escalation summary. A block dialog
+ * competes with whatever the operator was already doing, so the ceiling is a
+ * glanceable line, not a paragraph. Both are hard clamps, not suggestions.
+ */
+export const SBAR_INTENT_MAX = 160;
+export const SBAR_RATIONALE_MAX = 200;
+
+/**
+ * The same intent and rationale {@link buildJudgeInput} reads, clamped for a
+ * human instead of a model.
+ *
+ * It lives here, next to the tracker, so freshness semantics have exactly one
+ * owner: a rationale the judge is told predates the call can never be shown to
+ * an operator as if it were stated this turn.
+ *
+ * No evidence fencing. These strings are rendered to a terminal, not parsed by
+ * a model, so a fence would be noise a human has to read past.
+ */
+export function buildEscalationContext(tracker: ProvenanceTracker): EscalationBackground {
+	const rationale = tracker.rationaleView();
+	return {
+		userIntent: oneLine(tracker.latestUserIntent(), SBAR_INTENT_MAX),
+		agentRationale: oneLine(rationale.text, SBAR_RATIONALE_MAX),
+		rationaleFreshness: rationale.freshness,
+		rationaleFromReasoning: rationale.fromReasoning,
 	};
 }

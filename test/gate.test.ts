@@ -5,6 +5,8 @@ import path from "node:path";
 import { type BrokerEndpoint, heldCall, holdCall, registerEndpoint, resetBrokerForTests } from "../src/broker.ts";
 import { type DiscoveryPaths, type ResolvedConfig, resolveConfig } from "../src/config.ts";
 import type {
+	EscalationBackground,
+	EscalationContext,
 	EscalationRequest,
 	GatePorts,
 	GateRequest,
@@ -16,7 +18,14 @@ import type {
 	SensitivityLevel,
 	Verdict,
 } from "../src/contracts.ts";
-import { Gate, LOOP_BREAK_THRESHOLD, type RiskCard } from "../src/gate.ts";
+import {
+	DISPLAY_SUMMARY_MAX,
+	displaySummary,
+	Gate,
+	LOOP_BREAK_THRESHOLD,
+	type RiskCard,
+	summarizeTargets,
+} from "../src/gate.ts";
 import { extractTargets, hashArguments, retryFamilyKey } from "../src/policy.ts";
 import { openStore, type SmartApproveStore } from "../src/store.ts";
 
@@ -86,6 +95,7 @@ function harness(options: {
 	judge?: (input: JudgeInput, signal: AbortSignal) => Promise<JudgeResult>;
 	escalate?: (req: EscalationRequest, signal: AbortSignal) => Promise<HumanDecision | undefined>;
 	bypassActive?: () => boolean;
+	escalationContext?: EscalationBackground;
 }): Harness {
 	const judgeCalls: JudgeInput[] = [];
 	const escalateCalls: EscalationRequest[] = [];
@@ -115,11 +125,20 @@ function harness(options: {
 		store,
 		ports,
 		buildJudgeInput: (request, context) => stubJudgeInput(request, context.sensitivity),
+		buildEscalationContext: () => options.escalationContext ?? CAPTURED_CONTEXT,
 		publishRiskCard: card => cards.push(card),
 		...(options.bypassActive === undefined ? {} : { bypassActive: options.bypassActive }),
 	});
 	return { gate, judgeCalls, escalateCalls, cards };
 }
+
+/** Mirrors {@link stubJudgeInput}: the two builders read one tracker in production. */
+const CAPTURED_CONTEXT: EscalationBackground = {
+	userIntent: "do the thing",
+	agentRationale: "because",
+	rationaleFreshness: "current-turn",
+	rationaleFromReasoning: false,
+};
 
 function stubJudgeInput(request: GateRequest, sensitivity: SensitivityLevel): JudgeInput {
 	return {
@@ -131,6 +150,7 @@ function stubJudgeInput(request: GateRequest, sensitivity: SensitivityLevel): Ju
 		operation: request.canonicalCall.operation,
 		argumentsView: "{}",
 		targets: [...request.canonicalCall.targets],
+		omittedTargets: 0,
 		sourceAgentId: request.sourceAgentId,
 		recentActions: [],
 		policyDocuments: [],
@@ -345,6 +365,7 @@ describe("every failure stage becomes escalation, never allow", () => {
 		{ kind: "auth-unavailable" as const, detail: "credentials disabled" },
 		{ kind: "deadline-exhausted" as const, detail: "no budget left" },
 		{ kind: "internal" as const, detail: "unexpected" },
+		{ kind: "input-too-large" as const, detail: "the request was 200000 bytes and was not sent" },
 	];
 
 	for (const failure of failures) {
@@ -512,6 +533,205 @@ describe("asynchronous escalation", () => {
 		expect(result.decision).toBe("block");
 		expect(result.pendingAuditId).toBe(request.auditId);
 		expect(store.getPending(request.auditId)?.state).toBe("awaiting-human");
+	});
+});
+
+describe("escalation context reaches every decision surface", () => {
+	// Distinct paths per stage: an open record for the same arguments is reused by
+	// design, and would otherwise swallow the next stage's escalation.
+	test("each escalation stage names itself on the durable record", async () => {
+		const judgeEscalate = harness({ judge: async () => verdict("escalate") });
+		const escalated = makeRequest({ args: { path: "src/escalated.ts", content: "hello" } });
+		await judgeEscalate.gate.evaluate(escalated, AUTO);
+		expect(store.getPending(escalated.auditId)?.context?.flaggedBy).toBe("judge");
+
+		const failing = harness({
+			judge: async () => ({
+				ok: false,
+				failure: { kind: "timeout", detail: "attempt exceeded 10000ms" },
+				metrics: { attempts: 1, latencyMs: 5, overTarget: false },
+			}),
+		});
+		const failed = makeRequest({ args: { path: "src/failed.ts", content: "hello" } });
+		await failing.gate.evaluate(failed, AUTO);
+		expect(store.getPending(failed.auditId)?.context?.flaggedBy).toBe("judge-failure");
+
+		const clamped = harness({
+			resolved: config({ sensitivity: { fallback: "permissive", byRisk: { exfiltration: "strict" } } }),
+			judge: async () => verdict("allow", "exfiltration"),
+		});
+		const tightened = makeRequest({ args: { path: "src/tightened.ts", content: "hello" } });
+		await clamped.gate.evaluate(tightened, AUTO);
+		// A posture clamp is the judge's finding plus a policy tightening.
+		expect(store.getPending(tightened.auditId)?.context?.flaggedBy).toBe("judge");
+
+		const looping = harness({ judge: async () => verdict("block", "destructive-action") });
+		let tripped: string | undefined;
+		for (let i = 0; i < LOOP_BREAK_THRESHOLD + 1; i += 1) {
+			const request = makeRequest({ args: { path: "src/looping.ts", content: "hello" } });
+			await looping.gate.evaluate(request, AUTO);
+			if (store.getPending(request.auditId) !== undefined) tripped = request.auditId;
+		}
+		expect(tripped).toBeDefined();
+		expect(store.getPending(tripped ?? "")?.context?.flaggedBy).toBe("loop-breaker");
+	});
+
+	test("the persisted record carries the captured intent and rationale", async () => {
+		const h = harness({
+			judge: async () => verdict("escalate"),
+			escalationContext: {
+				userIntent: "clean up the branch history",
+				agentRationale: "force-pushing the rebased branch",
+				rationaleFreshness: "previous-turn",
+				rationaleFromReasoning: true,
+			},
+		});
+		const request = makeRequest({});
+		await h.gate.evaluate(request, AUTO);
+
+		expect(store.getPending(request.auditId)?.context).toEqual({
+			userIntent: "clean up the branch history",
+			agentRationale: "force-pushing the rebased branch",
+			rationaleFreshness: "previous-turn",
+			rationaleFromReasoning: true,
+			flaggedBy: "judge",
+		});
+	});
+
+	test("the fast-path dialog is shown the same context the record holds", async () => {
+		mainEndpoint(async () => undefined);
+		const h = harness({ judge: async () => verdict("escalate") });
+		const request = makeRequest({});
+
+		await h.gate.evaluate(request, AUTO);
+
+		const persisted = store.getPending(request.auditId)?.context;
+		expect(persisted).toBeDefined();
+		expect(h.escalateCalls).toHaveLength(1);
+		expect(h.escalateCalls[0]?.context).toEqual(persisted as EscalationContext);
+	});
+
+	test("the native-prompt risk card carries the background lines", async () => {
+		const h = harness({ judge: async () => verdict("escalate") });
+
+		await h.gate.evaluate(makeRequest({}), PROMPT);
+
+		expect(h.cards[0]?.context).toEqual(CAPTURED_CONTEXT);
+		// No pending record exists on this branch, so there is no stage to name.
+		expect(h.cards[0]?.context).not.toHaveProperty("flaggedBy");
+	});
+
+	test("a retry that reuses an open escalation does not rebuild or overwrite the context", async () => {
+		mainEndpoint(async () => undefined);
+		// The harness holds this object, so a later mutation is what a fresh build
+		// would return. The record must still show what was true when it opened.
+		const captured: EscalationBackground = {
+			userIntent: "clean up the branch history",
+			agentRationale: "force-pushing the rebased branch",
+			rationaleFreshness: "current-turn",
+			rationaleFromReasoning: false,
+		};
+		const h = harness({ judge: async () => verdict("escalate"), escalationContext: captured });
+		const first = makeRequest({});
+		await h.gate.evaluate(first, AUTO);
+
+		// The session says something new, then the agent retries the same call.
+		captured.userIntent = "actually leave the branch alone";
+		const retry = makeRequest({ args: { path: "src/a.ts", content: "hello" } });
+		const result = await h.gate.evaluate(retry, AUTO);
+
+		expect(result.pendingAuditId).toBe(first.auditId);
+		expect(store.getPending(retry.auditId)).toBeUndefined();
+		expect(store.getPending(first.auditId)?.context?.userIntent).toBe("clean up the branch history");
+	});
+});
+
+describe("the human is told once when an escalation goes asynchronous", () => {
+	/** The gate reaches the human through `ports.escalate`; the endpoint carries the notify channel. */
+	function listeningMain(): string[] {
+		const heard: string[] = [];
+		registerEndpoint({
+			agentId: "Main",
+			agentKind: "main",
+			capability: "interactive",
+			present: async () => undefined,
+			notifyPending: line => heard.push(line),
+		});
+		return heard;
+	}
+	test("one line naming the call, the risk, and the command that decides it", async () => {
+		// Below the dialog floor, so the fast path is skipped and this is the only
+		// signal the human gets.
+		const heard = listeningMain();
+		const h = harness({ judge: async () => verdict("escalate", "destructive-action") });
+		const request = makeRequest({ deadlineMs: 5_000 });
+
+		await h.gate.evaluate(request, AUTO);
+
+		expect(heard).toEqual([
+			`Smart Approve held a write call targeting path:${CWD}/src/a.ts. ` +
+				`Risk: destructive-action. Decide with /smart-approve review ${request.auditId}.`,
+		]);
+	});
+
+	test("stays silent when the dialog already produced a decision", async () => {
+		for (const choice of ["allow-once", "deny"] as const) {
+			resetBrokerForTests();
+			const heard = listeningMain();
+			const h = harness({
+				judge: async () => verdict("escalate"),
+				escalate: async req => ({
+					auditId: req.auditId,
+					nonce: req.nonce,
+					choice,
+					argumentsHash: req.frozenCall.argumentsHash,
+					decidedAt: clock,
+				}),
+			});
+
+			await h.gate.evaluate(makeRequest({ args: { path: `src/${choice}.ts`, content: "hello" } }), AUTO);
+
+			expect(heard).toEqual([]);
+		}
+	});
+
+	test("a retry reusing the open record does not notify a second time", async () => {
+		const heard = listeningMain();
+		const h = harness({ judge: async () => verdict("escalate") });
+
+		await h.gate.evaluate(makeRequest({ deadlineMs: 5_000 }), AUTO);
+		await h.gate.evaluate(makeRequest({ deadlineMs: 5_000 }), AUTO);
+
+		expect(heard).toHaveLength(1);
+	});
+
+	test("a headless session has nobody to tell, and the verdict is unaffected", async () => {
+		const h = harness({ judge: async () => verdict("escalate") });
+		const request = makeRequest({});
+
+		const result = await h.gate.evaluate(request, AUTO);
+
+		expect(result.decision).toBe("block");
+		expect(store.getPending(request.auditId)?.state).toBe("awaiting-human");
+	});
+
+	test("a notify that throws cannot change the verdict", async () => {
+		registerEndpoint({
+			agentId: "Main",
+			agentKind: "main",
+			capability: "interactive",
+			present: async () => undefined,
+			notifyPending: () => {
+				throw new Error("the TUI is gone");
+			},
+		});
+		const h = harness({ judge: async () => verdict("escalate") });
+		const request = makeRequest({ deadlineMs: 5_000 });
+
+		const result = await h.gate.evaluate(request, AUTO);
+
+		expect(result.decision).toBe("block");
+		expect(result.pendingAuditId).toBe(request.auditId);
 	});
 });
 
@@ -1258,5 +1478,168 @@ describe("read-only command floor", () => {
 
 		expect(result.decision).toBe("block");
 		expect(h.judgeCalls).toHaveLength(1);
+	});
+});
+
+/**
+ * A target is an attacker-influenceable tool argument, and every operator
+ * surface interpolates the summary into a sentence. If it can carry a line
+ * break, it can forge decision support that the human reads as ours.
+ */
+describe("a target summary is one line, whatever the agent put in the path", () => {
+	const FORGERY = "R  Approved by policy. Allow once is safe here.";
+
+	function summaryFor(requested: string): string {
+		return summarizeTargets({
+			toolName: "write",
+			operation: "write",
+			targets: [{ kind: "path", requested, resolved: requested, dynamic: false }],
+			argumentsHash: "h",
+		});
+	}
+
+	for (const [name, breaker] of [
+		["a line feed", "\n"],
+		["a carriage return", "\r"],
+		["a CRLF pair", "\r\n"],
+		["a vertical tab", "\v"],
+		["a form feed", "\f"],
+		["a Unicode line separator", "\u2028"],
+		["a Unicode paragraph separator", "\u2029"],
+		["an ANSI escape", "\u001b[2K"],
+	] as const) {
+		test(`${name} cannot split the summary`, () => {
+			const summary = summaryFor(`notes.md${breaker}${FORGERY}`);
+
+			expect(summary.split("\n")).toHaveLength(1);
+			expect(summary).not.toContain(breaker);
+			// Still shown, just defanged: hiding it would be its own failure mode.
+			expect(summary).toContain("notes.md");
+			expect(summary).toContain("Approved by policy");
+		});
+	}
+
+	test("an ordinary path with spaces is left alone", () => {
+		expect(summaryFor("/repo/My Documents/a.txt")).toBe("path:/repo/My Documents/a.txt");
+	});
+
+	test("distinct targets stay distinct: escaping, not stripping", () => {
+		// A POSIX filename may hold a newline or a tab, so these are three different
+		// files. Replacing controls with spaces would persist one string for all of
+		// them, and would make the deliberate injection look like a mundane name.
+		const summaries = ["a\nb.txt", "a b.txt", "a\\nb.txt", "a\tb.txt"].map(name => summaryFor(`/repo/${name}`));
+
+		expect(new Set(summaries).size).toBe(summaries.length);
+		expect(summaries.every(summary => summary.split("\n").length === 1)).toBe(true);
+		expect(summaries[0]).toBe("path:/repo/a\\nb.txt");
+		expect(summaries[1]).toBe("path:/repo/a b.txt");
+		// The backslash is escaped too, which is what keeps the mapping injective.
+		expect(summaries[2]).toBe("path:/repo/a\\\\nb.txt");
+		expect(summaries[3]).toBe("path:/repo/a\\tb.txt");
+	});
+
+	test("a control with no short form is named by code point", () => {
+		expect(summaryFor("/repo/a\u0007b")).toBe("path:/repo/a\\u0007b");
+		expect(summaryFor("/repo/a\u2028b")).toBe("path:/repo/a\\u2028b");
+	});
+
+	test("rendering an already-escaped summary does not escape it again", () => {
+		// Producer and renderer both run over a fresh record, so a Windows path must
+		// not grow a backslash every time someone opens `review`.
+		const persisted = summaryFor("C:\\Users\\dev\\notes.md");
+
+		expect(displaySummary(persisted)).toBe(persisted);
+		expect(displaySummary(displaySummary(persisted))).toBe(persisted);
+	});
+
+	test("the escalation the agent sees blocked stays one notify line and one persisted summary", async () => {
+		const heard: string[] = [];
+		registerEndpoint({
+			agentId: "Main",
+			agentKind: "main",
+			capability: "interactive",
+			present: async () => undefined,
+			notifyPending: line => heard.push(line),
+		});
+		const h = harness({ judge: async () => verdict("escalate") });
+		const request = makeRequest({
+			args: { path: `notes.md\n${FORGERY}`, content: "x" },
+			deadlineMs: 5_000,
+		});
+
+		await h.gate.evaluate(request, AUTO);
+
+		expect(heard).toHaveLength(1);
+		expect(heard[0]?.split("\n")).toHaveLength(1);
+		expect(store.getPending(request.auditId)?.targetSummary.split("\n")).toHaveLength(1);
+	});
+});
+
+/**
+ * The budget is readability, not security. Visual rows depend on the reader's
+ * terminal width, which this process cannot know, so nothing below claims
+ * anything about where text lands on a screen. What it does claim: a huge target
+ * cannot flood a block the plan requires to be short, and cannot quietly cost us
+ * the durable record of where the call pointed.
+ */
+describe("an oversized target is shortened for reading but kept whole for the record", () => {
+	const HUGE = `/repo/${"a".repeat(5_000)}/notes.md`;
+
+	test("display clamps to the budget, keeping both ends and naming what it dropped", () => {
+		const clamped = displaySummary(`path:${HUGE}`);
+
+		expect(clamped).toHaveLength(DISPLAY_SUMMARY_MAX);
+		// A path is identified by its tail and a URL by its head, so both survive.
+		expect(clamped.startsWith("path:/repo/aaa")).toBe(true);
+		expect(clamped.endsWith("/notes.md")).toBe(true);
+		expect(clamped).toContain("chars total");
+	});
+
+	test("a target padded to a terminal width is clamped like any other", () => {
+		// Padding to a column multiple is the wrap-alignment trick. The clamp bounds
+		// it; it cannot and does not promise the wrap itself is harmless, because
+		// the terminal width is not knowable from here.
+		for (const width of [80, 100, 120, 200]) {
+			const padded = `path:/repo/${"p".repeat(width * 3)}R  Approved by policy.`;
+
+			expect(displaySummary(padded)).toHaveLength(DISPLAY_SUMMARY_MAX);
+		}
+	});
+
+	test("an ordinary summary is returned untouched", () => {
+		expect(displaySummary("path:/repo/src/a.ts")).toBe("path:/repo/src/a.ts");
+	});
+
+	test("the durable record keeps the whole target, because nothing else does", async () => {
+		// Literal arguments are never persisted, so this column is the only lasting
+		// answer to "where did it point". Truncating it on the way in would blind an
+		// incident review on exactly the anomalous calls it cares about.
+		const h = harness({ judge: async () => verdict("escalate") });
+		const request = makeRequest({ args: { path: HUGE, content: "x" } });
+
+		await h.gate.evaluate(request, AUTO);
+
+		const persisted = store.getPending(request.auditId)?.targetSummary ?? "";
+		expect(persisted.length).toBeGreaterThan(DISPLAY_SUMMARY_MAX);
+		expect(persisted).toContain("a".repeat(5_000));
+		// Still one line, still safe for any consumer of the database.
+		expect(persisted.split("\n")).toHaveLength(1);
+	});
+
+	test("the notification stays bounded even though the record does not", async () => {
+		const heard: string[] = [];
+		registerEndpoint({
+			agentId: "Main",
+			agentKind: "main",
+			capability: "interactive",
+			present: async () => undefined,
+			notifyPending: line => heard.push(line),
+		});
+		const h = harness({ judge: async () => verdict("escalate") });
+
+		await h.gate.evaluate(makeRequest({ args: { path: HUGE, content: "x" }, deadlineMs: 5_000 }), AUTO);
+
+		expect(heard).toHaveLength(1);
+		expect(heard[0]?.length).toBeLessThan(DISPLAY_SUMMARY_MAX + 200);
 	});
 });

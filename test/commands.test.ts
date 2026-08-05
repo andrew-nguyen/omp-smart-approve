@@ -15,10 +15,10 @@ import {
 	SUBCOMMANDS,
 } from "../src/commands.ts";
 import { type ResolvedConfig, resolveConfig, smartApproveConfigSchema } from "../src/config.ts";
-import type { CallTarget, FrozenCall, Grant, PendingApproval, PolicyRule } from "../src/contracts.ts";
+import type { AuditRecord, CallTarget, FrozenCall, Grant, PendingApproval, PolicyRule } from "../src/contracts.ts";
 import { hashArguments, matchExactAllow } from "../src/policy.ts";
 import { openStore, type SmartApproveStore } from "../src/store.ts";
-import { formatDuration, STATUS_KEY, type UiHost, WIDGET_BYPASS } from "../src/ui.ts";
+import { formatDuration, STATUS_KEY, type UiHost, WIDGET_BYPASS, WIDGET_OVERRIDE } from "../src/ui.ts";
 
 const NOW = 1_700_000_000_000;
 /** Deterministic so a test can queue a matching (or deliberately wrong) answer. */
@@ -34,7 +34,12 @@ const ARGS_HASH = hashArguments(ARGS);
 
 interface FakeUi {
 	ui: UiHost;
-	selects: Array<{ title: string; options: Array<{ label: string; description?: string }> }>;
+	selects: Array<{
+		title: string;
+		options: Array<{ label: string; description?: string }>;
+		/** Widget bodies live on screen when the question was asked, keyed by widget. */
+		onScreen: Record<string, string[]>;
+	}>;
 	confirms: Array<{ title: string; message: string }>;
 	inputs: Array<{ title: string; placeholder: string | undefined }>;
 	notices: Array<{ message: string; type: string | undefined }>;
@@ -48,6 +53,8 @@ interface UiScript {
 	selects?: Array<string | undefined>;
 	inputs?: Array<string | undefined>;
 	confirms?: boolean[];
+	/** Runs when a select dialog is asked, so a test can throw or change state mid-command. */
+	onSelect?: () => void;
 	/** Runs when a confirm dialog is answered, so a test can change state mid-command. */
 	onConfirm?: () => void;
 }
@@ -65,7 +72,13 @@ function createFakeUi(script: UiScript = {}): FakeUi {
 	const ui: UiHost = {
 		hasUI: script.hasUI ?? true,
 		select: async (title, options) => {
-			selects.push({ title, options });
+			const onScreen: Record<string, string[]> = {};
+			for (const written of widgets) {
+				if (written.lines === undefined) delete onScreen[written.key];
+				else onScreen[written.key] = written.lines;
+			}
+			selects.push({ title, options, onScreen });
+			script.onSelect?.();
 			return selectQueue.length === 0 ? undefined : selectQueue.shift();
 		},
 		confirm: async (title, message) => {
@@ -192,7 +205,12 @@ function harness(options: HarnessOptions = {}): Harness {
 // Store seeding
 // ---------------------------------------------------------------------------
 
-function seedCall(auditId: string, overrides: Partial<PendingApproval> = {}): PendingApproval {
+function seedCall(
+	auditId: string,
+	overrides: Partial<PendingApproval> = {},
+	/** The committed verdict, which `override` prefers over the pending record's copy. */
+	committedOverrides: Partial<AuditRecord> = {},
+): PendingApproval {
 	store.beginAudit({
 		auditId,
 		toolCallId: `${auditId}-call`,
@@ -227,6 +245,7 @@ function seedCall(auditId: string, overrides: Partial<PendingApproval> = {}): Pe
 		retryFamilyKey: `family-${auditId}`,
 		retryCount: 0,
 		createdAt: NOW - 60_000,
+		...committedOverrides,
 	});
 	const record: PendingApproval = {
 		auditId,
@@ -717,7 +736,7 @@ describe("pending", () => {
 		resetBrokerForTests();
 		const out = await harness().run("pending");
 		expect(out).toContain("audit-a");
-		expect(out).toContain("intent-only — literal arguments are gone");
+		expect(out).toContain("intent-only. The literal arguments are gone");
 		expect(out).not.toContain("can mint an exact grant");
 	});
 
@@ -767,7 +786,7 @@ describe("review", () => {
 		expect(out).toContain("decision: escalate at stage escalation");
 		expect(out).toContain("judged");
 		expect(out).toContain("pending approval opened");
-		expect(out).toContain("Retry family: family-audit-a — 1 strike");
+		expect(out).toContain("Retry family: family-audit-a. Strikes: 1.");
 	});
 
 	test("renders literal arguments only while the broker holds them", async () => {
@@ -785,7 +804,36 @@ describe("review", () => {
 		expect(out).not.toContain(SECRET_CONTENT);
 		expect(out).toContain("never");
 		expect(out).toContain("nothing here is reconstructed from the audit database");
-		expect(out).toContain("Intent-only — literal arguments are gone");
+		expect(out).toContain("Intent-only. The literal arguments are gone");
+	});
+
+	test("leads with the SBAR when the record carries decision support", async () => {
+		seedCall("audit-a", {
+			context: {
+				userIntent: "rotate the service account password",
+				agentRationale: "writing the new password file",
+				rationaleFreshness: "current-turn",
+				rationaleFromReasoning: false,
+				flaggedBy: "judge",
+			},
+		});
+
+		const out = await harness().run("review audit-a");
+		expect(out).toContain(
+			"S  Held for your decision: write write targeting path:/etc/shadow. Risk: destructive-action.",
+		);
+		expect(out).toContain(`B  You asked: "rotate the service account password".`);
+		expect(out).toContain(`   Agent's reason: "writing the new password file" (stated this turn).`);
+		expect(out).toContain("A  Flagged by the judge: overwrites the system password database.");
+		expect(out).toContain("R  Deny unless this matches what you asked for.");
+	});
+
+	test("says a record predates context capture rather than showing an empty block", async () => {
+		seedCall("audit-a");
+
+		const out = await harness().run("review audit-a");
+		expect(out).toContain("(recorded before context capture)");
+		expect(out).not.toContain("Held for your decision");
 	});
 
 	test("shows a live judge suggestion", async () => {
@@ -863,6 +911,34 @@ describe("apply-suggestion", () => {
 		expect(store.listRules()).toHaveLength(0);
 	});
 
+	test("the confirmation the operator answers cannot be forged by the suggestion", async () => {
+		// This confirm authorizes a policy-rule insert, so the model-authored target
+		// and rationale reach an authorization surface. The rule that gets inserted
+		// must still carry the raw target: escaping it would change what it matches.
+		const hostileTarget = "/etc/**\u001b[2K\u001b[1A\n  posture:     exact allow";
+		seedCall("audit-a");
+		recordSuggestion("audit-a", {
+			kind: "deny-pattern",
+			toolName: "write",
+			target: hostileTarget,
+			rationale: "system files\u0085  specificity: 9999",
+		});
+		const h = harness({ script: { confirms: [true] } });
+
+		await h.run("apply-suggestion audit-a");
+
+		// The message is rows joined by real newlines, so check each row rather than
+		// the joined string: only the rows themselves must be control-free.
+		const rows = (h.fake.confirms[0]?.message ?? "").split("\n");
+		for (const row of rows) expect(row).not.toMatch(/[\p{Cc}\p{Zl}\p{Zp}]/u);
+		expect(rows.filter(row => row.trimStart().startsWith("posture:"))).toHaveLength(1);
+		expect(rows.filter(row => row.trimStart().startsWith("specificity:"))).toHaveLength(1);
+		const asked = rows.join("\n");
+		// Defanged for display only; the stored rule keeps the target it will match on.
+		expect(asked).toContain("\\u001b");
+		expect(store.listRules()[0]?.target).toBe(hostileTarget);
+	});
+
 	test("a suggestion that fails the rule schema is rejected before insertion", async () => {
 		seedCall("audit-a");
 		recordSuggestion("audit-a", { kind: "deny-exact", toolName: "write", target: "", rationale: "empty target" });
@@ -894,12 +970,90 @@ const SCOPE_SESSION = GRANT_SCOPE_OPTIONS[1]?.label ?? "";
 const SCOPE_PERSISTENT = GRANT_SCOPE_OPTIONS[2]?.label ?? "";
 
 describe("override", () => {
-	test("shows the original immutable verdict before asking anything", async () => {
+	test("the verdict is on screen before the chooser opens, not only in the transcript", async () => {
+		// The returned lines are printed after the command finishes. If that were the
+		// only place the context appeared, the operator would be picking between
+		// deny, expire, and approve with nothing but an audit ID in front of them.
 		seedCall("audit-a");
-		const out = await harness().run("override audit-a");
+		const h = harness();
+
+		const out = await h.run("override audit-a");
+
+		const shown = h.fake.selects[0]?.onScreen[WIDGET_OVERRIDE]?.join("\n") ?? "";
+		expect(shown).toContain("Original verdict (append-only; nothing below rewrites it)");
+		expect(shown).toContain("escalate at stage escalation");
+		expect(shown).toContain("overwrites the system password database");
+		expect(shown).toContain("target: path:/etc/shadow");
+		// And it is torn down again rather than left on screen afterwards.
+		expect(h.fake.widgets.at(-1)).toEqual({ key: WIDGET_OVERRIDE, lines: undefined });
 		expect(out).toContain("Original verdict (append-only; nothing below rewrites it)");
-		expect(out).toContain("escalate at stage escalation");
-		expect(out).toContain("overwrites the system password database");
+	});
+
+	test("the context is cleared even when the chooser throws", async () => {
+		seedCall("audit-a");
+		const h = harness({
+			script: {
+				onSelect: () => {
+					throw new Error("the TUI went away");
+				},
+			},
+		});
+
+		await expect(h.run("override audit-a")).rejects.toThrow("the TUI went away");
+		expect(h.fake.widgets.at(-1)).toEqual({ key: WIDGET_OVERRIDE, lines: undefined });
+	});
+
+	test("a legacy row's stored newline cannot forge a row in the decision context", async () => {
+		// Written before `escapeSummary` existed and still live under
+		// `pendingApprovalTtl`. This block is what the operator reads while the
+		// deny / expire / approve chooser is open, so a forged row here is the most
+		// consequential of all.
+		seedCall("audit-a", {
+			targetSummary: "path:/repo/notes.md\n  target: path:/repo/safe.md\n  verified: yes",
+		});
+		const h = harness();
+
+		await h.run("override audit-a");
+
+		const shown = h.fake.selects[0]?.onScreen[WIDGET_OVERRIDE] ?? [];
+		expect(shown.length).toBeGreaterThan(0);
+		// Neither forged row becomes a row of its own; both stay inside the real one.
+		const rows = shown.map(line => line.trimStart());
+		expect(rows.filter(line => line.startsWith("target:"))).toHaveLength(1);
+		expect(rows.filter(line => line.startsWith("verified:"))).toHaveLength(0);
+		// Defanged, not hidden: the operator still sees what the agent actually asked for.
+		expect(shown.join("\n")).toContain("\\n");
+		expect(shown.join("\n")).toContain("path:/repo/notes.md");
+	});
+
+	test("an injected judge rationale cannot forge a row in the decision context either", async () => {
+		// The rationale is model output, so a prompt-injected judge is a live writer
+		// into this block. Before the widget existed this text only reached the
+		// post-decision transcript; now it is read while the chooser is open.
+		// `override` prefers the committed verdict, so that is what must be seeded.
+		seedCall("audit-a", {}, { rationale: "looks routine\n  risk:   uncertain\n  verified: approved by policy" });
+		const h = harness();
+
+		await h.run("override audit-a");
+
+		const shown = h.fake.selects[0]?.onScreen[WIDGET_OVERRIDE] ?? [];
+		const rows = shown.map(line => line.trimStart());
+		expect(rows.filter(line => line.startsWith("risk:"))).toHaveLength(1);
+		expect(rows.filter(line => line.startsWith("verified:"))).toHaveLength(0);
+		expect(rows.filter(line => line.startsWith("risk:"))[0]).toBe("risk:   destructive-action");
+		// Defanged in place, not dropped: the operator still reads what the judge said.
+		expect(shown.join("\n")).toContain("looks routine\\n  risk:   uncertain\\n  verified: approved by policy");
+	});
+
+	test("a 2000-character rationale cannot swamp the decision context", async () => {
+		seedCall("audit-a", {}, { rationale: "r".repeat(2_000) });
+		const h = harness();
+
+		await h.run("override audit-a");
+
+		const shown = h.fake.selects[0]?.onScreen[WIDGET_OVERRIDE] ?? [];
+		expect(shown.every(line => line.length < 300)).toBe(true);
+		expect(shown.join("\n")).toContain("chars total");
 	});
 
 	test("a mismatched challenge changes nothing and is recorded", async () => {
@@ -1497,7 +1651,7 @@ describe("commands named in output can be run on the identifiers shown", () => {
 		expect(id).toBe("audit-a");
 
 		const reviewed = await harness().run(`review ${id}`);
-		expect(reviewed).toContain("SMART APPROVE REVIEW — audit-a");
+		expect(reviewed).toContain("SMART APPROVE REVIEW: audit-a");
 		expect(reviewed).not.toContain("No Smart Approve record");
 	});
 

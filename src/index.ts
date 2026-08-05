@@ -37,6 +37,7 @@ import {
 	writableConfigPath,
 } from "./config.ts";
 import {
+	buildEscalationContext,
 	buildJudgeInput,
 	createProvenanceTracker,
 	loadSessionRedactor,
@@ -301,6 +302,7 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 						postureHints: context.postureHints,
 						sensitivity: context.sensitivity,
 					}),
+				buildEscalationContext: () => buildEscalationContext(tracker),
 				publishRiskCard: (card: RiskCard) => ctx.ui.setWidget(WIDGET_RISK_CARD, renderRiskCard(card)),
 				bypassActive: () => bypass.active(),
 				recordSuggestion,
@@ -395,6 +397,9 @@ export function createSmartApproveExtension(dependencies: SmartApproveDependenci
 					agentKind: identity.agentKind,
 					...(identity.parentAgentId === undefined ? {} : { parentAgentId: identity.parentAgentId }),
 					capability: ctx.hasUI ? "interactive" : "headless",
+					// A block the human never sees is a block they cannot act on. The
+					// gate uses this only on the async path, once per escalation.
+					notifyPending: line => ctx.ui.notify(line, "warning"),
 					present: createApprovalPresenter(uiFor(ctx), now),
 				});
 

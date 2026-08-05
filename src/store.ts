@@ -33,12 +33,15 @@ import type {
 	AuditEventType,
 	AuditRecord,
 	Decision,
+	EscalationContext,
+	EscalationFlaggedBy,
 	GateStage,
 	Grant,
 	GrantScope,
 	PendingApproval,
 	PendingState,
 	PolicyRule,
+	RationaleFreshness,
 	RiskClass,
 	RuleKind,
 	SensitivityLevel,
@@ -314,9 +317,27 @@ const MIGRATION_2: readonly string[] = [
 	"CREATE INDEX IF NOT EXISTS idx_grants_location ON grants (arguments_hash, policy_hash, cwd)",
 ];
 
+/**
+ * Human decision support on an escalation record.
+ *
+ * The prose an operator reads is composed at render time from these clamped,
+ * already-redacted ingredients rather than stored as a sentence: wording can
+ * then change without rewriting history, and nothing but the ingredients is
+ * ever on disk. Nullable, so an existing database upgrades in place; a legacy
+ * row hydrates as no context at all and says so rather than rendering blanks.
+ */
+const MIGRATION_3: readonly string[] = [
+	"ALTER TABLE pending_approvals ADD COLUMN ctx_user_intent TEXT",
+	"ALTER TABLE pending_approvals ADD COLUMN ctx_agent_rationale TEXT",
+	"ALTER TABLE pending_approvals ADD COLUMN ctx_rationale_freshness TEXT",
+	"ALTER TABLE pending_approvals ADD COLUMN ctx_rationale_from_reasoning INTEGER",
+	"ALTER TABLE pending_approvals ADD COLUMN ctx_flagged_by TEXT",
+];
+
 export const MIGRATIONS: readonly Migration[] = [
 	{ version: 1, statements: MIGRATION_1 },
 	{ version: 2, statements: MIGRATION_2 },
+	{ version: 3, statements: MIGRATION_3 },
 ];
 
 /** Highest migration this build knows how to apply. */
@@ -547,6 +568,11 @@ interface PendingRow {
 	reopen_consumed_at: number | null;
 	resolved_at: number | null;
 	cwd: string | null;
+	ctx_user_intent: string | null;
+	ctx_agent_rationale: string | null;
+	ctx_rationale_freshness: RationaleFreshness | null;
+	ctx_rationale_from_reasoning: number | null;
+	ctx_flagged_by: EscalationFlaggedBy | null;
 }
 
 // `exactOptionalPropertyTypes` forbids `{ key: undefined }`, so a NULL column
@@ -618,6 +644,24 @@ function toRule(row: RuleRow): PolicyRule {
 	};
 }
 
+/**
+ * Hydrate decision support all-or-nothing, keyed on the stage column.
+ *
+ * The stage is the one ingredient with no meaningful empty value: an empty
+ * intent is itself a finding ("the agent acted with nothing captured"), so it
+ * cannot double as "this row predates capture". Keying on it is what keeps a
+ * legacy row from reading back as a half-filled object full of blanks.
+ */
+function toEscalationContext(row: PendingRow, flaggedBy: EscalationFlaggedBy): EscalationContext {
+	return {
+		userIntent: row.ctx_user_intent ?? "",
+		agentRationale: row.ctx_agent_rationale ?? "",
+		rationaleFreshness: row.ctx_rationale_freshness ?? "none",
+		rationaleFromReasoning: row.ctx_rationale_from_reasoning === 1,
+		flaggedBy,
+	};
+}
+
 function toPending(row: PendingRow): PendingApproval {
 	return {
 		auditId: row.audit_id,
@@ -639,6 +683,7 @@ function toPending(row: PendingRow): PendingApproval {
 		exemptAttempts: row.exempt_attempts,
 		...(row.reopen_consumed_at === null ? {} : { reopenConsumedAt: row.reopen_consumed_at }),
 		...(row.resolved_at === null ? {} : { resolvedAt: row.resolved_at }),
+		...(row.ctx_flagged_by === null ? {} : { context: toEscalationContext(row, row.ctx_flagged_by) }),
 	};
 }
 
@@ -655,7 +700,8 @@ const RULE_COLUMNS = `id, kind, tool_name, target, arguments_hash, cwd, operatio
 
 const PENDING_COLUMNS = `audit_id, tool_name, operation, target_summary, risk, rationale, arguments_hash,
 	canonical_hash, policy_hash, nonce, source_agent_id, parent_agent_id, state, created_at, expires_at,
-	exempt_attempts, reopen_consumed_at, resolved_at, cwd`;
+	exempt_attempts, reopen_consumed_at, resolved_at, cwd, ctx_user_intent, ctx_agent_rationale,
+	ctx_rationale_freshness, ctx_rationale_from_reasoning, ctx_flagged_by`;
 
 /**
  * A grant that could still admit a call. Anything else is spent history: it can
@@ -930,10 +976,11 @@ class SqliteStore implements SmartApproveStore {
 
 	putPending(pending: PendingApproval): void {
 		guardWrite("putPending", pending);
+		const context = pending.context;
 		const result = this.db
 			.query(
 				`INSERT INTO pending_approvals (${PENDING_COLUMNS})
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT (audit_id) DO UPDATE SET
 					risk = excluded.risk,
 					rationale = excluded.rationale,
@@ -943,7 +990,12 @@ class SqliteStore implements SmartApproveStore {
 					expires_at = excluded.expires_at,
 					exempt_attempts = excluded.exempt_attempts,
 					reopen_consumed_at = excluded.reopen_consumed_at,
-					resolved_at = excluded.resolved_at
+					resolved_at = excluded.resolved_at,
+					ctx_user_intent = excluded.ctx_user_intent,
+					ctx_agent_rationale = excluded.ctx_agent_rationale,
+					ctx_rationale_freshness = excluded.ctx_rationale_freshness,
+					ctx_rationale_from_reasoning = excluded.ctx_rationale_from_reasoning,
+					ctx_flagged_by = excluded.ctx_flagged_by
 				WHERE pending_approvals.state IN ${OPEN_STATES}`,
 			)
 			.run(
@@ -966,6 +1018,12 @@ class SqliteStore implements SmartApproveStore {
 				pending.reopenConsumedAt ?? null,
 				pending.resolvedAt ?? null,
 				pending.cwd,
+				context?.userIntent ?? null,
+				context?.agentRationale ?? null,
+				context?.rationaleFreshness ?? null,
+				// SQLite has no boolean; the mapper reads 1 as true and anything else as false.
+				context === undefined ? null : Number(context.rationaleFromReasoning),
+				context?.flaggedBy ?? null,
 			);
 		if (result.changes === 0) {
 			throw new StoreStateError(`escalation ${pending.auditId} is already resolved and cannot be reopened`);
