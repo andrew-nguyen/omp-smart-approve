@@ -24,6 +24,15 @@
 * quote, neutralize, and bound the `tool`, `operation`, and `requesting agent` fields in the judge prompt. `operation` is `${toolName}:${args.action}` for action-style tools, so it is agent-controlled; on a bare `key: value` line outside every evidence fence it could forge a `## AUTHORITATIVE POLICY` section, and unbounded it carried arbitrary bytes past the arguments-size budget into the model's window. Rule matching, retry hashing, and the audit row still see the raw value
 * bound the judge prompt's targets section, which duplicates every extracted target outside the size-bounded arguments view. One 60 KB path previously added about 120 KB there, and because a 60 KB path stays under the preserved-field limit the request was not flagged as incomplete, so the judge could still answer `allow`. Targets are now capped in count and length, the omitted count is stated, and anything hidden forces incomplete-context semantics, which forbid `allow`
 
+## [0.2.0](https://github.com/andrew-nguyen/omp-smart-approve/compare/v0.1.1...v0.2.0) (2026-08-05)
+
+
+### Features
+
+* add escalation SBAR and harden decision surfaces ([14e527d](https://github.com/andrew-nguyen/omp-smart-approve/commit/14e527d57ce65752e0a18af5fb64b1e0fdec9c2a))
+* add read-only command floor and fix judge evidence capture ([b46328b](https://github.com/andrew-nguyen/omp-smart-approve/commit/b46328b070ad38f3bb8d7312679fc5c8f20ff8d8))
+* let setup pick the judge and apply it without a restart ([46d6405](https://github.com/andrew-nguyen/omp-smart-approve/commit/46d64056cf1bbd66a2d1c0c254e21089468af80b))
+
 ## [0.1.1](https://github.com/andrew-nguyen/omp-smart-approve/compare/v0.1.0...v0.1.1) (2026-08-03)
 
 

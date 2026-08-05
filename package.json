@@ -1,6 +1,6 @@
 {
 	"name": "omp-smart-approve",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "An LLM safety judge in front of tool calls OMP would otherwise auto-approve. Hard-blocks clear attacks and clear mistakes, escalates genuine uncertainty to a human.",
 	"license": "MIT",
 	"type": "module",
